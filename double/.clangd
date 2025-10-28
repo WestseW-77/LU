@@ -1,0 +1,41 @@
+CompileFlags:
+  Add:
+    - "-std=c++17"
+    - "-I/usr/local/cuda-12.8/include"
+    - "-I/usr/local/cuda/include"
+    - "-I/usr/include/c++/11"
+    - "-I/usr/include/x86_64-linux-gnu/c++/11"
+    - "-D__CUDACC__"
+    - "-D__NVCC__"
+    - "-DCUDA_VERSION=12080"
+    - "--cuda-gpu-arch=sm_52"
+    - "--cuda-gpu-arch=sm_87"
+    - "--cuda-gpu-arch=sm_89"
+    - "--cuda-gpu-arch=sm_90"
+  Remove:
+    - "-forward-unknown-to-host-compiler"
+    - "--generate-code*"
+    - "-x"
+    - "cu"
+
+Index:
+  Background: Build
+
+Diagnostics:
+  ClangTidy:
+    Add: 
+      - "readability-*"
+      - "performance-*"
+    Remove:
+      - "readability-magic-numbers"
+
+Hover:
+  ShowAKA: Yes
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+
+Completion:
+  AllScopes: Yes

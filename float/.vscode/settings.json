@@ -1,4 +1,12 @@
 {
-    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
-    "C_Cpp.default.compilerPath": "/usr/bin/clang++"
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+  "C_Cpp.default.compilerPath": "/usr/bin/clang++",
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/float/build/compile_commands.json",
+  "files.associations": {
+    "*.cu": "cuda-cpp"
+  },
+  "cmake.sourceDirectory": "${workspaceFolder}/float",
+  "cmake.configureOnOpen": true
+  // "C_Cpp.default.compilerPath": "/usr/bin/clang++",
+  //   "cmake.sourceDirectory": "/home/ruinique/Hygon-Double-Blocking-Getrf/float"
 }

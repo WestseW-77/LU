@@ -1,4 +1,5 @@
 #include <cooperative_groups.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <vector>
@@ -7,7 +8,7 @@
 
 #define SWAP_LEN_PANEL 2048
 
-using data_type = double;
+using data_type = __half;
 
 void trsm(cublasHandle_t cublasH, long m, long n, float alpha, float *A, long lda,
           float *B, long ldb, long nb) {
@@ -27,6 +28,17 @@ void trsm(cublasHandle_t cublasH, long m, long n, float alpha, float *A, long ld
                              B + m / 2, ldb));
 
     trsm(cublasH, left, n, alpha, A + m / 2 + m / 2 * lda, lda, B + m / 2, ldb, nb);
+}
+
+// 期望返回矩阵 A，其中上三角是 U，下三角是 L，另外返回矩阵 P 对后续矩阵更新的选主元操作进行指导
+void TSLU(cublasHandle_t cublasH, long m, long n, float alpha, __half *A, long lda, half *Workspace, int *devIpiv, int *devInfo) {
+    // 首先判断是执行选主元的 kernel 还是不选主元的
+    if (devIpiv == NULL) { 
+        noPviotingLU(A, n, m, lda, alpha, pivoting, devIpiv, devInfo);
+    }
+    else {
+        PivotingLU(A, n, m, lda, alpha, pivoting, devIpiv, devInfo);
+    }
 }
 
 int parseArgs(int argc, char *argv[], size_t &n, size_t &k, size_t &nb,
@@ -91,6 +103,8 @@ int main(int argc, char *argv[]) {
         printf("data type using float\n");
     } else if constexpr (std::is_same_v<data_type, double>) {
         printf("data type using double\n");
+    } else if constexpr (std::is_same_v<data_type, __half>) {
+        printf("data type using half\n");
     }
 
     // 打印当前显卡
@@ -125,6 +139,8 @@ int main(int argc, char *argv[]) {
                                  P_d[i * n + i] = 1.0f;
                              else if constexpr (std::is_same_v<data_type, double>)
                                  P_d[i * n + i] = 1.0;
+                            else if constexpr (std::is_same_v<data_type, __half>)
+                                 P_d[i * n + i] = __float2half_rn(1.0f);
                          });
         oriA_device_vector = A_device_vector;
         oriA_d = thrust::raw_pointer_cast(oriA_device_vector.data());
@@ -217,6 +233,9 @@ int main(int argc, char *argv[]) {
                             reinterpret_cast<double *>(tslu_workspace_d), ipiv_d + j,
                             devInfo_d));
                     }
+                    else if constexpr (std::is_same_v<data_type, __half>) { 
+                        TSLU();
+                    }
                 } else {
                     if constexpr (std::is_same_v<data_type, float>) {
                         CUSOLVER_CHECK(cusolverDnSgetrf(
@@ -231,10 +250,13 @@ int main(int argc, char *argv[]) {
                             reinterpret_cast<double *>(tslu_workspace_d), NULL,
                             devInfo_d));
                     }
+                    else if constexpr (std::is_same_v<data_type, __half>) {
+                        TSLU();
+                    }
                 }
                 detail.tslu_time += stopTimer();
 
-                // 求 P 用来做校验
+                // 求 P 用来做校验， 这是整体的 P，在做校验的时候直接乘到 A 上去
                 if (pivoting && verifyResult) {
                     for (size_t idx = 0; idx < nb; idx++) {
                         // 主元选择结果

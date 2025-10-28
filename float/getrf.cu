@@ -9,9 +9,11 @@
 
 using data_type = float;
 
+//trsm采用调取cuBlas接口的形式
 void trsm(cublasHandle_t cublasH, long m, long n, float alpha, float *A, long lda,
           float *B, long ldb, long nb) {
     float sonefloat = 1.0, snegonefloat = -1.0;
+    //小于一定大小之后调用cublas的trsm
     if (m <= nb) {
         CUBLAS_CHECK(cublasStrsm(cublasH, CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
                                  CUBLAS_OP_N, CUBLAS_DIAG_UNIT, m, n, &alpha, A,
@@ -98,11 +100,12 @@ int main(int argc, char *argv[]) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("Device name: %s\n", prop.name);
 
-    int maxBlocksPerGrid = prop.multiProcessorCount;
+    int maxBlocksPerGrid = prop.multiProcessorCount;//sm的数量，在这个实现中确定了启动一次kernal会调用多少个block
     int threadsPerBlock = 256;
     int blocksPerGrid = maxBlocksPerGrid;
 
     // 初始化 A 矩阵，用来测试
+    //thrust是CUDA上的CPP STL，算是high level 的 API
     thrust::device_vector<data_type> A_device_vector(n * n);
     auto A_d = thrust::raw_pointer_cast(A_device_vector.data());
     generateNormalMatrix(A_device_vector, n, n);
@@ -547,6 +550,7 @@ int parseArgs(int argc, char *argv[], size_t &n, size_t &k, size_t &nb,
     return 0;
 }
 
+//核心计算LU的函数
 template <typename T>
 void computeMinusOfPAandLU(thrust::device_vector<T> &A_device_vector,
                            thrust::device_vector<T> &oriA_device_vector,
