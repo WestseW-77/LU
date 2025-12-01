@@ -30,16 +30,6 @@ void trsm(cublasHandle_t cublasH, long m, long n, float alpha, float *A, long ld
     trsm(cublasH, left, n, alpha, A + m / 2 + m / 2 * lda, lda, B + m / 2, ldb, nb);
 }
 
-// 期望返回矩阵 A，其中上三角是 U，下三角是 L，另外返回矩阵 P 对后续矩阵更新的选主元操作进行指导
-void TSLU(cublasHandle_t cublasH, long m, long n, float alpha, __half *A, long lda, half *Workspace, int *devIpiv, int *devInfo) {
-    // 首先判断是执行选主元的 kernel 还是不选主元的
-    if (devIpiv == NULL) { 
-        noPviotingLU(A, n, m, lda, alpha, pivoting, devIpiv, devInfo);
-    }
-    else {
-        PivotingLU(A, n, m, lda, alpha, pivoting, devIpiv, devInfo);
-    }
-}
 
 int parseArgs(int argc, char *argv[], size_t &n, size_t &k, size_t &nb,
               bool &verifyResult, bool &pivoting, bool &debug_mode,

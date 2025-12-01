@@ -138,7 +138,6 @@ void printMatrixHost(thrust::host_vector<T>& A_host_vector, size_t m, size_t n) 
 template <typename T>
 void printMatrixDevice(thrust::device_vector<T>& A_device_vector, size_t m, size_t n,
                        const char* name) {
-    // TODO: 记得删掉
     bool donothing = false;
     if (donothing) return;
     printf("\n========== matrix %s ==========\n", name);
