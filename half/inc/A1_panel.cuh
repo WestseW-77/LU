@@ -40,9 +40,9 @@
 // 简单的 half 绝对值辅助函数
 static __device__ __forceinline__ half half_abs(half x) {
 #if __CUDA_ARCH__ >= 530
-    return fabsf(x);
+    return __habs(x);
 #else
-    return fabsf(x);
+    return __habs(x);
 #endif
 }
 
@@ -86,7 +86,7 @@ __global__ void panel_pivot_search_kernel(
     // 全局的步长
     const int global_stride = blockDim.x * gridDim.x;
 
-    // 每个线程选出自己所访问数据的最大值
+    // 每个线程选出自己所访问数据的最大值, idx 
     for (int idx = base_row + blockIdx.x * blockDim.x + tid; idx < m; idx += global_stride) {
         half a = A[idx + (size_t)col * lda];
         half v = half_abs(a);
@@ -121,6 +121,7 @@ __global__ void panel_pivot_search_kernel(
 
 /**
  * kernel 2: 对 block 级结果做最终规约，写入 d_ipiv_rel[k]
+ * 这里理论上是只起了一个 block 进行运算，来总和前面若干个 block 得到的结果
  *
  * 输入:
  *   block_val, block_idx : 来自 kernel1 的每个 block 的局部最大值/行号
@@ -138,28 +139,41 @@ __global__ void panel_pivot_reduce_kernel(
 {
     half max_val = 0.0f;
     int  max_idx = j0 + k;
+    int  tid = threadIdx.x;
 
+    
     for (int i = threadIdx.x; i < num_blocks; i += blockDim.x) {
         half v = block_val[i];
-        int   r = block_idx[i];
+        int  r = block_idx[i];
         if (v > max_val) {
             max_val = v;
             max_idx = r;
         }
     }
 
-    // 用一个 block，线程 0 写结果即可
-    __shared__ half s_val;
-    __shared__ int   s_idx;
-    if (threadIdx.x == 0) {
-        s_val = max_val;
-        s_idx = max_idx;
-    }
+    // 结果写入 shared memory
+    extern __shared__ unsigned char smem[];
+    half* s_val = reinterpret_cast<half*>(smem);
+    int*  s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
+
+    s_val[tid] = max_val;
+    s_idx[tid] = max_idx;
     __syncthreads();
 
-    // 为了简单，这里假定 blockDim.x 足够小，直接让 0 号线程写回
-    if (threadIdx.x == 0) {
-        int pivot_row = s_idx;
+    // 二分规约
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_val[tid + stride] > s_val[tid]) {
+                s_val[tid] = s_val[tid + stride];
+                s_idx[tid] = s_idx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    // 0 号线程写回，写回的是相对行号
+    if (tid == 0) {
+        int pivot_row = s_idx[0];
         int rel = pivot_row - (j0 + k);
         d_ipiv_rel[k] = rel;
     }
@@ -186,25 +200,29 @@ __global__ void panel_row_swap_kernel(
     const int* __restrict__ d_ipiv_rel)
 {
     int col_k = j0 + k;
-    if (col_k >= m) return;
+    if (col_k >= m) 
+        return;
 
     int rel = d_ipiv_rel[k];
     int pivot_row = (j0 + k) + rel;
     int row_k     = j0 + k;
 
-    if (pivot_row == row_k) return;
+    if (pivot_row == row_k) 
+        return;
 
     int j = j0 + blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= j0 + ib) return;
+    if (j >= j0 + ib) 
+        return;
 
     size_t col_offset = (size_t)j * lda;
-    half tmp = A[row_k   + col_offset];
-    A[row_k   + col_offset] = A[pivot_row + col_offset];
+    half tmp = A[row_k + col_offset];
+    A[row_k + col_offset] = A[pivot_row + col_offset];
     A[pivot_row + col_offset] = tmp;
 }
 
 /**
  * kernel 4: 对列 j0+k 做 L 列缩放：A[r, col_k] /= A[col_k, col_k]
+ * 这里可能会是精度问题时需要找的地方
  */
 __global__ void panel_column_scale_kernel(
     half* __restrict__ A,
@@ -213,20 +231,22 @@ __global__ void panel_column_scale_kernel(
     const int* __restrict__ d_ipiv_rel)
 {
     int col_k = j0 + k;
-    if (col_k >= m) return;
+    if (col_k >= m) 
+        return;
 
     // 行交换之后，pivot 已经在 (row_k=col_k) 行
-    half pivot_h = A[col_k + (size_t)col_k * lda];
-    float pivot  = __half2float(pivot_h);
-    if (pivot == 0.0f) return; // 简单防护，实际应用中可考虑加小阈值
+    half pivot = A[col_k + (size_t)col_k * lda];
+    // [健壮性]
+    if (pivot == __float2half(0.0f)) 
+        return;
 
     int r = col_k + 1 + blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= m) return;
+    if (r >= m) 
+        return;
 
-    half val_h = A[r + (size_t)col_k * lda];
-    float val  = __half2float(val_h);
-    float l    = val / pivot;
-    A[r + (size_t)col_k * lda] = __float2half(l);
+    half val = A[r + (size_t)col_k * lda];
+    // [指令替换]
+    A[r + (size_t)col_k * lda] = val / pivot;
 }
 
 /**
@@ -245,7 +265,8 @@ __global__ void panel_update_kernel(
     int col_start = col_k + 1;
     int col_end   = j0 + ib;
 
-    if (col_k >= m) return;
+    if (col_k >= m) 
+        return;
 
     int r = row_k + 1 + blockIdx.y * blockDim.y + threadIdx.y;
     int c = col_start + blockIdx.x * blockDim.x + threadIdx.x;
@@ -255,18 +276,16 @@ __global__ void panel_update_kernel(
     size_t col_k_off = (size_t)col_k * lda;
     size_t col_c_off = (size_t)c     * lda;
 
-    half  L_h = A[r + col_k_off];
-    half  U_h = A[row_k + col_c_off];
-
-    float L_f = __half2float(L_h);
-    float U_f = __half2float(U_h);
+    half  L = A[r + col_k_off];
+    half  U = A[row_k + col_c_off];
 
     half  A_h = A[r + col_c_off];
-    float A_f = __half2float(A_h);
-
-    float res = A_f - L_f * U_f;
-    A[r + col_c_off] = __float2half(res);
+    // 可以考虑 half2 进行向量化加速
+    half res = __hsub(A_h, __hmul(L,U));
+    A[r + col_c_off] = res;
 }
+
+
 
 /**
  * panel_TSLU 的 host 端入口。
@@ -320,9 +339,9 @@ inline void launch_panel_TSLU(
         num_blocks_pivot = 1;
 
     // 分配临时缓冲：每个 block 的局部最大值及其行号
-    float* d_block_val = nullptr;
+    half* d_block_val = nullptr;
     int*   d_block_idx = nullptr;
-    CUDA_CHECK(cudaMallocAsync(&d_block_val, sizeof(float) * num_blocks_pivot, stream));
+    CUDA_CHECK(cudaMallocAsync(&d_block_val, sizeof(half) * num_blocks_pivot, stream));
     CUDA_CHECK(cudaMallocAsync(&d_block_idx, sizeof(int)   * num_blocks_pivot, stream));
 
     dim3 grid_row_swap((unsigned)((ib + 255) / 256));
@@ -330,17 +349,19 @@ inline void launch_panel_TSLU(
 
     // update kernel 的 block 形状：行 x 列
     int tile_c = (uc > 0) ? uc : 8;
-    if (tile_c > 32) tile_c = 32;
+    if (tile_c > 32) 
+        tile_c = 32;
     dim3 block_upd(tile_c, 8);
 
     for (int k = 0; k < ib; ++k) {
         int col = j0 + k;
-        if (col >= m) break;
+        if (col >= m) 
+            break;
 
         // 1) pivot 搜索：多 block 扫描 [j0+k, m)
         {
             dim3 grid_pivot(num_blocks_pivot);
-            size_t shmem = sizeof(float) * threads_pivot + sizeof(int) * threads_pivot;
+            size_t shmem = sizeof(half) * threads_pivot + sizeof(int) * threads_pivot;
             panel_pivot_search_kernel<<<grid_pivot, threads_pivot, shmem, stream>>>(
                 A, m, lda, j0, k, d_block_val, d_block_idx);
         }
@@ -349,7 +370,9 @@ inline void launch_panel_TSLU(
         {
             dim3 grid_red(1);
             dim3 block_red(128);
-            panel_pivot_reduce_kernel<<<grid_red, block_red, 0, stream>>>(
+            int threads_red = block_red.x;
+            size_t shmem_red = sizeof(half) * threads_red + sizeof(int) * threads_red;
+            panel_pivot_reduce_kernel<<<grid_red, block_red, shmem_red, stream>>>(
                 d_block_val, d_block_idx, num_blocks_pivot, j0, k, d_ipiv_rel);
         }
 
