@@ -38,7 +38,39 @@
 
 using half = __half;
 
-// 可选的计时结果（毫秒）
+// ============================================================================
+// 配置结构体
+// ============================================================================
+
+/**
+ * LU 分解的详细配置选项
+ */
+struct HgetrfConfig {
+    // GEMM 配置
+    bool use_tensor_core_gemm = true;   // 是否使用 Tensor Core GEMM
+    
+    // TRSM 配置
+    enum TrsmMode {
+        TRSM_CUSTOM_KERNEL,             // 使用自定义 half kernel
+        TRSM_CUBLAS_HALF,               // 使用 cuBLAS half TRSM (如果支持)
+        TRSM_CUBLAS_FLOAT               // 使用 cuBLAS float TRSM (需要类型转换)
+    };
+    TrsmMode trsm_mode = TRSM_CUSTOM_KERNEL;
+    
+    // Exchange 配置
+    bool use_batched_exchange = true;   // 是否批量交换
+    
+    // Stream 配置
+    bool use_dual_stream = false;       // 是否使用双 stream overlap
+    
+    // 调试选项
+    bool verbose = false;               // 是否输出详细信息
+    bool check_errors = false;          // 是否每步检查错误
+};
+
+/**
+ * 性能计时结果（毫秒）
+ */
 struct HgetrfTimers {
     double panel_ms    = 0.0;
     double exchange_ms = 0.0;
@@ -48,9 +80,12 @@ struct HgetrfTimers {
     int    panels      = 0;
 };
 
+// ============================================================================
+// 辅助函数
+// ============================================================================
+
 /**
- * Helper: 根据 panel pivot 更新全局行置换 piv_rows（host 端数组）。
- * piv_rows[i] 表示 LU 完成后第 i 行来源的原始行号。
+ * 根据 panel pivot 更新全局行置换
  */
 inline void hgetrf_update_pivots_host(
     int j0, int ib,
@@ -69,37 +104,15 @@ inline void hgetrf_update_pivots_host(
     }
 }
 
-/**
- * 全半精度分块 LU 分解入口 (blocking getrf)。
- *
- * 功能：
- *   逐 panel 执行 panel_TSLU -> 行交换扩散 -> A12 TRSM -> A22 GEMM，
- *   把结果直接写回 dA，输出 L/U（单位下三角 + 上三角）混存于 dA。
- *
- * 约束/假设：
- *   - 当前 panel kernel仅支持 IB in {32,64,128,256}。函数会在这些里选取
- *     不超过 ib_pref 且不超过剩余列数的最大候选。
- *   - 默认假设矩阵列数 n >= 32，且按列主序、lda>=m。
- *   - h_ipiv_rel、piv_rows 为 host 指针，容量分别 >= ib_pref、>= m。
- *   - d_ipiv_rel 为 device int 数组，容量 >= ib_pref。
- *   - 如果 handle 为空或 use_cublas_tc=false，则 trailing update 走 naive CUDA 版本。
- *
- * 输入/输出：
- *   dA         : [in/out] 设备端 half 矩阵，因地 factor，结果混存 L/U。
- *   m, n, lda  : 行数、列数、leading dimension。
- *   ib_pref    : 希望使用的最大 panel 宽度（将自动按 32/64/128/256 选不超过它的最佳）。
- *   uc         : panel 内核微块宽度（将截断到当前 panel 宽度）。
- *   handle     : cuBLAS 句柄，用于 A22 GEMM（可为 nullptr）。
- *   d_ipiv_rel : 设备端 pivot 相对位移 (长度 ib)。
- *   h_ipiv_rel : host 端 pivot 缓冲 (长度 ib)。
- *   piv_rows   : host 端全局行置换 (长度 m)，函数内会写入最终置换。
- *   stream     : 可选 CUDA stream。
- *   use_cublas_tc : true 时用 Tensor Core GEMM，否则用 naive CUDA GEMM。
- *   use_cublas_trsm : true 时 A12 使用 cublasTrsmEx，false 走定制 kernel。
- */
-// hgetrf.cuh 中的一个实现版本
-// 只给出 hgetrf_blocked_half，其他不动
+// ============================================================================
+// 主接口：标准版本（兼容原接口）
+// ============================================================================
 
+/**
+ * 标准 Half 精度分块 LU 分解
+ * 
+ * 保持与原接口兼容，使用默认配置
+ */
 inline void hgetrf_blocked_half(
     half* dA,
     int m, int n, int lda,
@@ -110,7 +123,7 @@ inline void hgetrf_blocked_half(
     int* piv_rows,
     cudaStream_t stream = 0,
     bool use_cublas_tc   = true,
-    bool use_cublas_trsm = true,
+    bool use_cublas_trsm = false,  // 改为 false，默认用自定义 kernel
     HgetrfTimers* timers = nullptr)
 {
     if (!dA || !d_ipiv_rel || !h_ipiv_rel || !piv_rows) {
@@ -127,7 +140,7 @@ inline void hgetrf_blocked_half(
         piv_rows[i] = i;
     }
 
-    // ---- 预先计算所有 panel 的 (j0_k, ib_k) ----
+    // 计算所有 panel 的 (j0, ib)
     std::vector<int> panel_j0;
     std::vector<int> panel_ib;
     {
@@ -154,7 +167,7 @@ inline void hgetrf_blocked_half(
     const int num_panels = (int)panel_j0.size();
     if (num_panels == 0) return;
 
-    // ---- stream & event ----
+    // Stream & Event
     cudaStream_t stream_update = stream;
     cudaStream_t stream_panel  = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_panel, cudaStreamNonBlocking));
@@ -188,14 +201,12 @@ inline void hgetrf_blocked_half(
         *acc_ms += (double)ms;
     };
 
-    // ---- 工具 lambda：panel / exchange / TRSM / GEMM ----
-
+    // 工具函数
     auto do_panel = [&](int j0, int ib_now) {
         int uc_now = (uc > ib_now) ? ib_now : uc;
         time_range(stream_panel, timers ? &timers->panel_ms : nullptr, [&]() {
             launch_panel_TSLU(dA, m, lda, j0, ib_now, uc_now, d_ipiv_rel, stream_panel);
         });
-        // 取回 pivot 位移
         CUDA_CHECK(cudaMemcpyAsync(h_ipiv_rel, d_ipiv_rel,
                                    sizeof(int) * ib_now,
                                    cudaMemcpyDeviceToHost,
@@ -216,9 +227,10 @@ inline void hgetrf_blocked_half(
         int ntrail = n - col0;
         if (ntrail <= 0 || ib_now <= 0) return;
 
+        time_range(stream_update, timers ? &timers->trsm_ms : nullptr, [&]() {
+            if (use_cublas_trsm) {
+                // 尝试使用 cuBLAS (需要检查是否支持 half)
 #if defined(CUBLAS_TRSM_ALGO_DEFAULT_TENSOR_OP)
-        if (use_cublas_trsm && handle) {
-            time_range(stream_update, timers ? &timers->trsm_ms : nullptr, [&]() {
                 const float alpha = 1.0f;
                 half* L11 = dA + j0 + (size_t)j0   * lda;
                 half* A12 = dA + j0 + (size_t)col0 * lda;
@@ -230,22 +242,23 @@ inline void hgetrf_blocked_half(
                         CUBLAS_FILL_MODE_LOWER,
                         CUBLAS_OP_N,
                         CUBLAS_DIAG_UNIT,
-                        ib_now,  // m
-                        ntrail,  // n
+                        ib_now,
+                        ntrail,
                         &alpha,
                         L11, CUDA_R_16F, lda,
                         A12, CUDA_R_16F, lda,
                         A12, CUDA_R_16F, lda,
                         CUDA_R_32F,
                         CUBLAS_TRSM_ALGO_DEFAULT_TENSOR_OP));
-            });
-        } else
-#endif
-        {
-            time_range(stream_update, timers ? &timers->trsm_ms : nullptr, [&]() {
+#else
+                // Fallback to custom kernel
                 launch_A12_trsm(dA, m, n, lda, j0, ib_now, stream_update);
-            });
-        }
+#endif
+            } else {
+                // 使用自定义 kernel
+                launch_A12_trsm(dA, m, n, lda, j0, ib_now, stream_update);
+            }
+        });
     };
 
     auto do_gemm_range = [&](int j0, int ib_now, int col0, int n2) {
@@ -265,12 +278,9 @@ inline void hgetrf_blocked_half(
         do_gemm_range(j0, ib_now, col0, n2);
     };
 
-    // ---- Pipeline 调度：look-ahead=1 ----
-
-    // 先做 panel(0)
+    // Pipeline: look-ahead=1
     do_panel(panel_j0[0], panel_ib[0]);
 
-    // 主循环：处理 panel 0..num_panels-2
     for (int k = 0; k < num_panels - 1; ++k) {
         int j0   = panel_j0[k];
         int ib_k = panel_ib[k];
@@ -278,25 +288,19 @@ inline void hgetrf_blocked_half(
         int j0_next   = panel_j0[k+1];
         int ib_next   = panel_ib[k+1];
 
-        // 1) 先在 update stream 上做 exchange(k), TRSM(k)
         do_exchange(j0, ib_k);
         do_trsm(j0, ib_k);
 
-        // 2) GEMM1(k)：只更新下一块 panel 所在列块
         {
-            int col0_next = j0 + ib_k;  // 下一 panel 的起始列
-            int n2_next   = ib_next;    // 下一 panel 的宽度
+            int col0_next = j0 + ib_k;
+            int n2_next   = ib_next;
             do_gemm_range(j0, ib_k, col0_next, n2_next);
-
-            // GEMM1 完成后，下一 panel 所需数据已就绪，记录事件
             CUDA_CHECK(cudaEventRecord(ev_next_ready, stream_update));
         }
 
-        // 3) 在 panel stream 上等待 GEMM1 完成，然后做 panel(k+1)
         CUDA_CHECK(cudaStreamWaitEvent(stream_panel, ev_next_ready, 0));
         do_panel(j0_next, ib_next);
 
-        // 4) 在 update stream 上继续 GEMM2(k)：更新剩余尾部列
         {
             int col0_tail = j0 + ib_k + ib_next;
             int n2_tail   = n - col0_tail;
@@ -304,25 +308,18 @@ inline void hgetrf_blocked_half(
                 do_gemm_range(j0, ib_k, col0_tail, n2_tail);
             }
         }
-
-        // 5) panel(k+1) 已经完成，GEMM2(k) 也完成，
-        //    下一轮循环会对 panel(k+1) 做 exchange/TRSM。
     }
 
-    // 处理最后一个 panel: num_panels-1
     {
         int k_last = num_panels - 1;
         int j0_last = panel_j0[k_last];
         int ib_last = panel_ib[k_last];
 
-        // 最后一块 panel 已经在上一步 do_panel() 完成
-        // 这里只需要做 exchange + TRSM + full GEMM
         do_exchange(j0_last, ib_last);
         do_trsm(j0_last, ib_last);
         do_gemm_full(j0_last, ib_last);
     }
 
-    // ---- 收尾 ----
     CUDA_CHECK(cudaStreamSynchronize(stream_update));
     CUDA_CHECK(cudaStreamSynchronize(stream_panel));
 
@@ -343,4 +340,61 @@ inline void hgetrf_blocked_half(
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream_panel));
+}
+
+// ============================================================================
+// 增强接口：使用配置结构体
+// ============================================================================
+
+/**
+ * 增强版 Half 精度分块 LU 分解
+ * 
+ * 使用 HgetrfConfig 结构体进行配置
+ */
+inline void hgetrf_blocked_half_ex(
+    half* dA,
+    int m, int n, int lda,
+    int ib_pref, int uc,
+    cublasHandle_t handle,
+    int* d_ipiv_rel,
+    int* h_ipiv_rel,
+    int* piv_rows,
+    const HgetrfConfig& config,
+    cudaStream_t stream = 0,
+    HgetrfTimers* timers = nullptr)
+{
+    // 根据配置调用标准接口
+    bool use_tc = config.use_tensor_core_gemm;
+    bool use_cublas_trsm = (config.trsm_mode == HgetrfConfig::TRSM_CUBLAS_HALF);
+    
+    if (config.verbose) {
+        printf("[hgetrf] Configuration:\n");
+        printf("  Tensor Core GEMM: %s\n", use_tc ? "enabled" : "disabled");
+        printf("  TRSM mode: ");
+        switch (config.trsm_mode) {
+            case HgetrfConfig::TRSM_CUSTOM_KERNEL:
+                printf("custom kernel\n");
+                break;
+            case HgetrfConfig::TRSM_CUBLAS_HALF:
+                printf("cuBLAS half\n");
+                break;
+            case HgetrfConfig::TRSM_CUBLAS_FLOAT:
+                printf("cuBLAS float (not implemented)\n");
+                break;
+        }
+        printf("  Batched exchange: %s\n", config.use_batched_exchange ? "enabled" : "disabled");
+    }
+    
+    hgetrf_blocked_half(
+        dA, m, n, lda,
+        ib_pref, uc,
+        handle,
+        d_ipiv_rel,
+        h_ipiv_rel,
+        piv_rows,
+        stream,
+        use_tc,
+        use_cublas_trsm,
+        timers
+    );
 }
