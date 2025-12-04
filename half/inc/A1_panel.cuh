@@ -7,10 +7,14 @@
 
 /**
  * ============================================================================
- * A1_panel.cuh - 稳定版本（经过验证）
+ * A1_panel.cuh - 针对TS矩阵的实用优化
  * ============================================================================
  * 
- * 这是您原始的稳定实现，只做了最小的自适应优化
+ * 优化点：
+ * 1. Warp shuffle优化pivot reduction
+ * 2. 针对TS矩阵调整update tile（4×32 vs 8×8）
+ * 3. 更激进的配置策略
+ * 4. 不使用cooperative（避免开销）
  * 
  * ============================================================================
  */
@@ -36,10 +40,10 @@ static __device__ __forceinline__ half half_abs(half x) {
 }
 
 // ============================================================================
-// Pivot kernels - 完全保持原样
+// 优化的Pivot Search（使用warp shuffle）
 // ============================================================================
 
-__global__ void panel_pivot_search_kernel(
+__global__ void optimized_panel_pivot_search_kernel(
     const half* __restrict__ A,
     int m, int lda,
     int j0, int k,
@@ -60,6 +64,7 @@ __global__ void panel_pivot_search_kernel(
     const int tid = threadIdx.x;
     const int global_stride = blockDim.x * gridDim.x;
 
+    // Step 1: 每个线程搜索自己的行
     for (int idx = base_row + blockIdx.x * blockDim.x + tid; idx < m; idx += global_stride) {
         half a = A[idx + (size_t)col * lda];
         half v = half_abs(a);
@@ -69,23 +74,45 @@ __global__ void panel_pivot_search_kernel(
         }
     }
 
-    s_val[tid] = local_max_val;
-    s_idx[tid] = local_max_idx;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            if (s_val[tid + stride] > s_val[tid]) {
-                s_val[tid] = s_val[tid + stride];
-                s_idx[tid] = s_idx[tid + stride];
-            }
+    // Step 2: Warp内reduction（使用shuffle）
+    const int lane = tid % WARP_SIZE;
+    const int warp_id = tid / WARP_SIZE;
+    
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        half other_val = __shfl_down_sync(0xffffffff, local_max_val, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
+        if (other_val > local_max_val) {
+            local_max_val = other_val;
+            local_max_idx = other_idx;
         }
-        __syncthreads();
     }
 
-    if (tid == 0) {
-        block_val[blockIdx.x] = s_val[0];
-        block_idx[blockIdx.x] = s_idx[0];
+    // Step 3: 每个warp的第一个线程写到shared memory
+    const int num_warps = blockDim.x / WARP_SIZE;
+    if (lane == 0) {
+        s_val[warp_id] = local_max_val;
+        s_idx[warp_id] = local_max_idx;
+    }
+    __syncthreads();
+
+    // Step 4: 第一个warp做最终reduction
+    if (warp_id == 0) {
+        half warp_max = (lane < num_warps) ? s_val[lane] : __float2half(0.0f);
+        int warp_idx = (lane < num_warps) ? s_idx[lane] : base_row;
+        
+        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+            half other_val = __shfl_down_sync(0xffffffff, warp_max, offset);
+            int other_idx = __shfl_down_sync(0xffffffff, warp_idx, offset);
+            if (other_val > warp_max) {
+                warp_max = other_val;
+                warp_idx = other_idx;
+            }
+        }
+        
+        if (lane == 0) {
+            block_val[blockIdx.x] = warp_max;
+            block_idx[blockIdx.x] = warp_idx;
+        }
     }
 }
 
@@ -96,7 +123,7 @@ __global__ void panel_pivot_reduce_kernel(
     int j0, int k,
     int* __restrict__ d_ipiv_rel)
 {
-    half max_val = 0.0f;
+    half max_val = __float2half(0.0f);
     int  max_idx = j0 + k;
     int  tid = threadIdx.x;
 
@@ -133,6 +160,10 @@ __global__ void panel_pivot_reduce_kernel(
         d_ipiv_rel[k] = rel;
     }
 }
+
+// ============================================================================
+// 其他Kernels - 保持不变
+// ============================================================================
 
 __global__ void panel_row_swap_kernel(
     half* __restrict__ A,
@@ -208,7 +239,7 @@ __global__ void panel_update_kernel(
 }
 
 // ============================================================================
-// 主入口 - 使用原始稳定实现
+// 主入口 - 优化配置
 // ============================================================================
 
 inline void launch_panel_TSLU(
@@ -228,40 +259,58 @@ inline void launch_panel_TSLU(
     if (ib <= 0) return;
     if (j0 < 0 || j0 >= m) return;
 
+    const int m_effective = m - j0;
+    if (m_effective <= 0) return;
+
+    // ========== 优化的Pivot配置 ==========
     const int threads_pivot = 256;
-    const int rows_per_block = 128;
-
-    int max_rows = m - j0;
-    if (max_rows <= 0) return;
-
-    int num_blocks_pivot = (max_rows + rows_per_block - 1) / rows_per_block;
+    int rows_per_block;
+    
+    // 针对TS矩阵：m_effective始终很大，使用大block
+    if (m_effective >= 24576) {
+        rows_per_block = 1024;  // 更激进
+    } else if (m_effective >= 12288) {
+        rows_per_block = 512;
+    } else if (m_effective >= 4096) {
+        rows_per_block = 256;
+    } else {
+        rows_per_block = 128;
+    }
+    
+    int num_blocks_pivot = (m_effective + rows_per_block - 1) / rows_per_block;
     if (num_blocks_pivot <= 0) num_blocks_pivot = 1;
+    if (num_blocks_pivot > 64) num_blocks_pivot = 64;  // 减少block数
 
+    // 分配临时buffer
     half* d_block_val = nullptr;
     int*  d_block_idx = nullptr;
     CUDA_CHECK(cudaMallocAsync(&d_block_val, sizeof(half) * num_blocks_pivot, stream));
     CUDA_CHECK(cudaMallocAsync(&d_block_idx, sizeof(int) * num_blocks_pivot, stream));
 
-    dim3 grid_row_swap((unsigned)((ib + 255) / 256));
+    // Row swap配置
+    dim3 grid_row_swap((ib + 255) / 256);
     dim3 block_row_swap(256);
 
-    int tile_c = (uc > 0) ? uc : 8;
-    if (tile_c > 32) tile_c = 32;
-    dim3 block_upd(tile_c, 8);
+    // ========== 优化的Update配置（针对TS）==========
+    // TS矩阵：行多列少，使用高瘦的tile
+    int tile_c = 4;   // 更少的列（ib通常128，4列更合适）
+    int tile_r = 32;  // 更多的行（m很大，32行更好）
+    dim3 block_upd(tile_c, tile_r);
 
+    // 主循环
     for (int k = 0; k < ib; ++k) {
         int col = j0 + k;
         if (col >= m) break;
 
-        // 1) pivot 搜索
+        // ========== Step 1: 优化的Pivot搜索 ==========
         {
             dim3 grid_pivot(num_blocks_pivot);
             size_t shmem = sizeof(half) * threads_pivot + sizeof(int) * threads_pivot;
-            panel_pivot_search_kernel<<<grid_pivot, threads_pivot, shmem, stream>>>(
+            optimized_panel_pivot_search_kernel<<<grid_pivot, threads_pivot, shmem, stream>>>(
                 A, m, lda, j0, k, d_block_val, d_block_idx);
         }
 
-        // 2) pivot 规约
+        // ========== Step 2: Pivot规约 ==========
         {
             dim3 grid_red(1);
             dim3 block_red(128);
@@ -271,13 +320,13 @@ inline void launch_panel_TSLU(
                 d_block_val, d_block_idx, num_blocks_pivot, j0, k, d_ipiv_rel);
         }
 
-        // 3) 行交换
+        // ========== Step 3: 行交换 ==========
         {
             panel_row_swap_kernel<<<grid_row_swap, block_row_swap, 0, stream>>>(
                 A, m, lda, j0, ib, k, d_ipiv_rel);
         }
 
-        // 4) 列缩放
+        // ========== Step 4: 列缩放 ==========
         {
             int rows_remaining = m - (j0 + k + 1);
             if (rows_remaining > 0) {
@@ -289,7 +338,7 @@ inline void launch_panel_TSLU(
             }
         }
 
-        // 5) panel 更新
+        // ========== Step 5: 优化的Panel更新 ==========
         {
             int rows_rem = m - (j0 + k + 1);
             int cols_rem = ib - (k + 1);
