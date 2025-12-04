@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #include "A1_panel.cuh"
 #include "A_exchange.cuh"
@@ -42,35 +43,24 @@ using half = __half;
 // 配置结构体
 // ============================================================================
 
-/**
- * LU 分解的详细配置选项
- */
 struct HgetrfConfig {
-    // GEMM 配置
-    bool use_tensor_core_gemm = true;   // 是否使用 Tensor Core GEMM
+    bool use_tensor_core_gemm = true;
     
-    // TRSM 配置
     enum TrsmMode {
-        TRSM_CUSTOM_KERNEL,             // 使用自定义 half kernel
-        TRSM_CUBLAS_HALF,               // 使用 cuBLAS half TRSM (如果支持)
-        TRSM_CUBLAS_FLOAT               // 使用 cuBLAS float TRSM (需要类型转换)
+        TRSM_CUSTOM_KERNEL,
+        TRSM_CUBLAS_HALF,
+        TRSM_CUBLAS_FLOAT
     };
     TrsmMode trsm_mode = TRSM_CUSTOM_KERNEL;
     
-    // Exchange 配置
-    bool use_batched_exchange = true;   // 是否批量交换
+    bool use_batched_exchange = true;
+    bool use_dual_stream = false;
+    bool verbose = false;
+    bool check_errors = false;
     
-    // Stream 配置
-    bool use_dual_stream = false;       // 是否使用双 stream overlap
-    
-    // 调试选项
-    bool verbose = false;               // 是否输出详细信息
-    bool check_errors = false;          // 是否每步检查错误
+    int fixed_panel_width = 128;
 };
 
-/**
- * 性能计时结果（毫秒）
- */
 struct HgetrfTimers {
     double panel_ms    = 0.0;
     double exchange_ms = 0.0;
@@ -81,12 +71,16 @@ struct HgetrfTimers {
 };
 
 // ============================================================================
+// 常量定义
+// ============================================================================
+
+constexpr int MAX_PANEL_WIDTH = 256;
+constexpr int DEFAULT_PANEL_WIDTH = 128;
+
+// ============================================================================
 // 辅助函数
 // ============================================================================
 
-/**
- * 根据 panel pivot 更新全局行置换
- */
 inline void hgetrf_update_pivots_host(
     int j0, int ib,
     const int* h_ipiv_rel,
@@ -105,15 +99,10 @@ inline void hgetrf_update_pivots_host(
 }
 
 // ============================================================================
-// 主接口：标准版本（兼容原接口）
+// 核心接口：Blocking LU
 // ============================================================================
 
-/**
- * 标准 Half 精度分块 LU 分解
- * 
- * 保持与原接口兼容，使用默认配置
- */
-inline void hgetrf_blocked_half(
+inline void hgetrf_blocked_half_optimized(
     half* dA,
     int m, int n, int lda,
     int ib_pref, int uc,
@@ -121,44 +110,34 @@ inline void hgetrf_blocked_half(
     int* d_ipiv_rel,
     int* h_ipiv_rel,
     int* piv_rows,
-    cudaStream_t stream = 0,
-    bool use_cublas_tc   = true,
-    bool use_cublas_trsm = false,  // 改为 false，默认用自定义 kernel
-    HgetrfTimers* timers = nullptr)
+    const HgetrfConfig& config,
+    cudaStream_t stream,
+    HgetrfTimers* timers)
 {
     if (!dA || !d_ipiv_rel || !h_ipiv_rel || !piv_rows) {
-        fprintf(stderr, "hgetrf_blocked_half: null pointer input.\n");
-        std::exit(EXIT_FAILURE);
-    }
-    if (ib_pref <= 0) {
-        fprintf(stderr, "hgetrf_blocked_half: ib_pref must be positive (ib_pref=%d).\n", ib_pref);
+        fprintf(stderr, "hgetrf_blocked_half_optimized: null pointer input.\n");
         std::exit(EXIT_FAILURE);
     }
 
-    // 初始化 pivot 行号
     for (int i = 0; i < m; ++i) {
         piv_rows[i] = i;
     }
 
-    // 计算所有 panel 的 (j0, ib)
+    int panel_width = config.fixed_panel_width;
+    if (panel_width <= 0 || panel_width > MAX_PANEL_WIDTH) {
+        panel_width = DEFAULT_PANEL_WIDTH;
+    }
+    if (ib_pref > 0 && ib_pref < panel_width) {
+        panel_width = ib_pref;
+    }
+
     std::vector<int> panel_j0;
     std::vector<int> panel_ib;
     {
         int j0 = 0;
-        const int candidates[] = {256, 128, 64, 32};
         while (j0 < n) {
             int remaining = n - j0;
-            int ib_cap = (ib_pref < remaining) ? ib_pref : remaining;
-            int ib_now = 0;
-            for (int cand : candidates) {
-                if (cand <= ib_cap) { ib_now = cand; break; }
-            }
-            if (ib_now == 0) {
-                fprintf(stderr,
-                        "hgetrf_blocked_half: remaining cols (%d) smaller than minimum supported panel width (32).\n",
-                        remaining);
-                std::exit(EXIT_FAILURE);
-            }
+            int ib_now = (remaining >= panel_width) ? panel_width : remaining;
             panel_j0.push_back(j0);
             panel_ib.push_back(ib_now);
             j0 += ib_now;
@@ -167,7 +146,11 @@ inline void hgetrf_blocked_half(
     const int num_panels = (int)panel_j0.size();
     if (num_panels == 0) return;
 
-    // Stream & Event
+    if (config.verbose) {
+        printf("[hgetrf] Fixed panel width: %d, Total panels: %d\n",
+               panel_width, num_panels);
+    }
+
     cudaStream_t stream_update = stream;
     cudaStream_t stream_panel  = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_panel, cudaStreamNonBlocking));
@@ -201,12 +184,13 @@ inline void hgetrf_blocked_half(
         *acc_ms += (double)ms;
     };
 
-    // 工具函数
     auto do_panel = [&](int j0, int ib_now) {
         int uc_now = (uc > ib_now) ? ib_now : uc;
+        
         time_range(stream_panel, timers ? &timers->panel_ms : nullptr, [&]() {
             launch_panel_TSLU(dA, m, lda, j0, ib_now, uc_now, d_ipiv_rel, stream_panel);
         });
+        
         CUDA_CHECK(cudaMemcpyAsync(h_ipiv_rel, d_ipiv_rel,
                                    sizeof(int) * ib_now,
                                    cudaMemcpyDeviceToHost,
@@ -228,8 +212,7 @@ inline void hgetrf_blocked_half(
         if (ntrail <= 0 || ib_now <= 0) return;
 
         time_range(stream_update, timers ? &timers->trsm_ms : nullptr, [&]() {
-            if (use_cublas_trsm) {
-                // 尝试使用 cuBLAS (需要检查是否支持 half)
+            if (config.trsm_mode == HgetrfConfig::TRSM_CUBLAS_HALF) {
 #if defined(CUBLAS_TRSM_ALGO_DEFAULT_TENSOR_OP)
                 const float alpha = 1.0f;
                 half* L11 = dA + j0 + (size_t)j0   * lda;
@@ -251,11 +234,9 @@ inline void hgetrf_blocked_half(
                         CUDA_R_32F,
                         CUBLAS_TRSM_ALGO_DEFAULT_TENSOR_OP));
 #else
-                // Fallback to custom kernel
                 launch_A12_trsm(dA, m, n, lda, j0, ib_now, stream_update);
 #endif
             } else {
-                // 使用自定义 kernel
                 launch_A12_trsm(dA, m, n, lda, j0, ib_now, stream_update);
             }
         });
@@ -264,7 +245,7 @@ inline void hgetrf_blocked_half(
     auto do_gemm_range = [&](int j0, int ib_now, int col0, int n2) {
         if (n2 <= 0 || ib_now <= 0) return;
         time_range(stream_update, timers ? &timers->gemm_ms : nullptr, [&]() {
-            if (use_cublas_tc && handle) {
+            if (config.use_tensor_core_gemm && handle) {
                 launch_A22_gemm_tc_range(dA, m, n, lda, j0, ib_now, col0, n2, handle, stream_update);
             } else {
                 launch_A22_gemm_naive_range(dA, m, n, lda, j0, ib_now, col0, n2, stream_update);
@@ -343,14 +324,126 @@ inline void hgetrf_blocked_half(
 }
 
 // ============================================================================
-// 增强接口：使用配置结构体
+// 智能接口
 // ============================================================================
 
-/**
- * 增强版 Half 精度分块 LU 分解
- * 
- * 使用 HgetrfConfig 结构体进行配置
- */
+inline void hgetrf_auto(
+    half* dA,
+    int m, int n, int lda,
+    int ib_request, int uc,
+    cublasHandle_t handle,
+    int* d_ipiv_rel,
+    int* h_ipiv_rel,
+    int* piv_rows,
+    const HgetrfConfig& config,
+    cudaStream_t stream = 0,
+    HgetrfTimers* timers = nullptr)
+{
+    if (!dA || !d_ipiv_rel || !h_ipiv_rel || !piv_rows) {
+        fprintf(stderr, "hgetrf_auto: null pointer input.\n");
+        std::exit(EXIT_FAILURE);
+    }
+
+    int panel_width = config.fixed_panel_width;
+    if (panel_width <= 0 || panel_width > MAX_PANEL_WIDTH) {
+        panel_width = DEFAULT_PANEL_WIDTH;
+    }
+    if (ib_request > 0 && ib_request < panel_width) {
+        panel_width = ib_request;
+    }
+
+    if (n <= panel_width) {
+        if (config.verbose) {
+            printf("[hgetrf_auto] Single panel mode (n=%d)\n", n);
+        }
+        
+        for (int i = 0; i < m; ++i) {
+            piv_rows[i] = i;
+        }
+        
+        cudaEvent_t ev0 = nullptr, ev1 = nullptr;
+        if (timers) {
+            CUDA_CHECK(cudaEventCreate(&ev0));
+            CUDA_CHECK(cudaEventCreate(&ev1));
+            CUDA_CHECK(cudaEventRecord(ev0, stream));
+        }
+        
+        launch_panel_TSLU(dA, m, lda, 0, n, uc, d_ipiv_rel, stream);
+        
+        if (timers) {
+            CUDA_CHECK(cudaEventRecord(ev1, stream));
+            CUDA_CHECK(cudaEventSynchronize(ev1));
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+            timers->panel_ms = (double)ms;
+            timers->total_ms = (double)ms;
+            timers->panels = 1;
+            CUDA_CHECK(cudaEventDestroy(ev0));
+            CUDA_CHECK(cudaEventDestroy(ev1));
+        }
+        
+        CUDA_CHECK(cudaMemcpyAsync(h_ipiv_rel, d_ipiv_rel,
+                                   sizeof(int) * n,
+                                   cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        hgetrf_update_pivots_host(0, n, h_ipiv_rel, m, piv_rows);
+        
+        return;
+    }
+    
+    if (config.verbose) {
+        printf("[hgetrf_auto] Blocking mode (n=%d, panel_width=%d)\n", n, panel_width);
+    }
+    
+    hgetrf_blocked_half_optimized(dA, m, n, lda,
+                                  panel_width, uc,
+                                  handle,
+                                  d_ipiv_rel,
+                                  h_ipiv_rel,
+                                  piv_rows,
+                                  config,
+                                  stream,
+                                  timers);
+}
+
+// ============================================================================
+// 兼容接口
+// ============================================================================
+
+inline void hgetrf_blocked_half(
+    half* dA,
+    int m, int n, int lda,
+    int ib_pref, int uc,
+    cublasHandle_t handle,
+    int* d_ipiv_rel,
+    int* h_ipiv_rel,
+    int* piv_rows,
+    cudaStream_t stream = 0,
+    bool use_cublas_tc   = true,
+    bool use_cublas_trsm = false,
+    HgetrfTimers* timers = nullptr)
+{
+    HgetrfConfig config;
+    config.use_tensor_core_gemm = use_cublas_tc;
+    config.trsm_mode = use_cublas_trsm ? 
+                       HgetrfConfig::TRSM_CUBLAS_HALF : 
+                       HgetrfConfig::TRSM_CUSTOM_KERNEL;
+    config.verbose = false;
+    config.fixed_panel_width = (ib_pref > 0 && ib_pref <= MAX_PANEL_WIDTH) ? 
+                               ib_pref : DEFAULT_PANEL_WIDTH;
+    
+    hgetrf_auto(dA, m, n, lda,
+               ib_pref, uc,
+               handle,
+               d_ipiv_rel,
+               h_ipiv_rel,
+               piv_rows,
+               config,
+               stream,
+               timers);
+}
+
 inline void hgetrf_blocked_half_ex(
     half* dA,
     int m, int n, int lda,
@@ -360,41 +453,16 @@ inline void hgetrf_blocked_half_ex(
     int* h_ipiv_rel,
     int* piv_rows,
     const HgetrfConfig& config,
-    cudaStream_t stream = 0,
-    HgetrfTimers* timers = nullptr)
+    cudaStream_t stream,
+    HgetrfTimers* timers)
 {
-    // 根据配置调用标准接口
-    bool use_tc = config.use_tensor_core_gemm;
-    bool use_cublas_trsm = (config.trsm_mode == HgetrfConfig::TRSM_CUBLAS_HALF);
-    
-    if (config.verbose) {
-        printf("[hgetrf] Configuration:\n");
-        printf("  Tensor Core GEMM: %s\n", use_tc ? "enabled" : "disabled");
-        printf("  TRSM mode: ");
-        switch (config.trsm_mode) {
-            case HgetrfConfig::TRSM_CUSTOM_KERNEL:
-                printf("custom kernel\n");
-                break;
-            case HgetrfConfig::TRSM_CUBLAS_HALF:
-                printf("cuBLAS half\n");
-                break;
-            case HgetrfConfig::TRSM_CUBLAS_FLOAT:
-                printf("cuBLAS float (not implemented)\n");
-                break;
-        }
-        printf("  Batched exchange: %s\n", config.use_batched_exchange ? "enabled" : "disabled");
-    }
-    
-    hgetrf_blocked_half(
-        dA, m, n, lda,
-        ib_pref, uc,
-        handle,
-        d_ipiv_rel,
-        h_ipiv_rel,
-        piv_rows,
-        stream,
-        use_tc,
-        use_cublas_trsm,
-        timers
-    );
+    hgetrf_auto(dA, m, n, lda,
+               ib_pref, uc,
+               handle,
+               d_ipiv_rel,
+               h_ipiv_rel,
+               piv_rows,
+               config,
+               stream,
+               timers);
 }

@@ -7,13 +7,11 @@
 
 /**
  * ============================================================================
- * A1_panel.cuh - 最终稳定版（完全基于原始代码）
+ * A1_panel.cuh - 稳定版本（经过验证）
  * ============================================================================
  * 
- * 经过多次测试，复杂优化都会引入性能退化。
- * 最稳定的方案：保持原始架构，只做最小改动。
+ * 这是您原始的稳定实现，只做了最小的自适应优化
  * 
- * 这是你的原始代码，几乎不做修改。
  * ============================================================================
  */
 
@@ -38,7 +36,7 @@ static __device__ __forceinline__ half half_abs(half x) {
 }
 
 // ============================================================================
-// Pivot kernels (完全保持原样)
+// Pivot kernels - 完全保持原样
 // ============================================================================
 
 __global__ void panel_pivot_search_kernel(
@@ -180,10 +178,6 @@ __global__ void panel_column_scale_kernel(
     A[r + (size_t)col_k * lda] = val / pivot;
 }
 
-// ============================================================================
-// Panel Update - 完全保持原样
-// ============================================================================
-
 __global__ void panel_update_kernel(
     half* __restrict__ A,
     int m, int lda,
@@ -214,7 +208,7 @@ __global__ void panel_update_kernel(
 }
 
 // ============================================================================
-// Main Entry - 完全保持原样
+// 主入口 - 使用原始稳定实现
 // ============================================================================
 
 inline void launch_panel_TSLU(
@@ -251,7 +245,6 @@ inline void launch_panel_TSLU(
     dim3 grid_row_swap((unsigned)((ib + 255) / 256));
     dim3 block_row_swap(256);
 
-    // 保持原始block配置
     int tile_c = (uc > 0) ? uc : 8;
     if (tile_c > 32) tile_c = 32;
     dim3 block_upd(tile_c, 8);
@@ -312,6 +305,7 @@ inline void launch_panel_TSLU(
 
     CUDA_CHECK(cudaFreeAsync(d_block_val, stream));
     CUDA_CHECK(cudaFreeAsync(d_block_idx, stream));
+    CUDA_CHECK(cudaGetLastError());
 }
 
 inline void cleanup_panel_buffers() {
