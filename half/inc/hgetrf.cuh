@@ -54,7 +54,7 @@ struct HgetrfConfig {
     TrsmMode trsm_mode = TRSM_CUSTOM_KERNEL;
     
     bool use_batched_exchange = true;
-    bool use_dual_stream = false;
+    bool use_multi_stream = false;  // 新增：启用多流水线
     bool verbose = false;
     bool check_errors = false;
     
@@ -99,7 +99,261 @@ inline void hgetrf_update_pivots_host(
 }
 
 // ============================================================================
-// 核心接口：Blocking LU
+// 核心接口：多流水线版本
+// ============================================================================
+
+inline void hgetrf_blocked_half_multistream(
+    half* dA,
+    int m, int n, int lda,
+    int ib_pref, int uc,
+    cublasHandle_t handle,
+    int* d_ipiv_rel,
+    int* h_ipiv_rel,
+    int* piv_rows,
+    const HgetrfConfig& config,
+    cudaStream_t stream,
+    HgetrfTimers* timers)
+{
+    if (!dA || !d_ipiv_rel || !h_ipiv_rel || !piv_rows) {
+        fprintf(stderr, "hgetrf_blocked_half_multistream: null pointer input.\n");
+        std::exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < m; ++i) {
+        piv_rows[i] = i;
+    }
+
+    int panel_width = config.fixed_panel_width;
+    if (panel_width <= 0 || panel_width > MAX_PANEL_WIDTH) {
+        panel_width = DEFAULT_PANEL_WIDTH;
+    }
+    if (ib_pref > 0 && ib_pref < panel_width) {
+        panel_width = ib_pref;
+    }
+
+    std::vector<int> panel_j0;
+    std::vector<int> panel_ib;
+    {
+        int j0 = 0;
+        while (j0 < n) {
+            int remaining = n - j0;
+            int ib_now = (remaining >= panel_width) ? panel_width : remaining;
+            panel_j0.push_back(j0);
+            panel_ib.push_back(ib_now);
+            j0 += ib_now;
+        }
+    }
+    const int num_panels = (int)panel_j0.size();
+    if (num_panels == 0) return;
+
+    if (config.verbose) {
+        printf("[hgetrf] Multi-stream mode, panel width: %d, panels: %d\n",
+               panel_width, num_panels);
+    }
+
+    // 创建4个独立stream
+    cudaStream_t stream_panel = nullptr;
+    cudaStream_t stream_exchange = nullptr;
+    cudaStream_t stream_trsm = nullptr;
+    cudaStream_t stream_gemm = nullptr;
+    
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_panel, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_exchange, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_trsm, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream_gemm, cudaStreamNonBlocking));
+
+    // Events for synchronization
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev_total0 = nullptr, ev_total1 = nullptr;
+    cudaEvent_t ev_panel_done = nullptr;
+    cudaEvent_t ev_exchange_done = nullptr;
+    cudaEvent_t ev_trsm_done = nullptr;
+
+    if (timers) {
+        *timers = HgetrfTimers{};
+        CUDA_CHECK(cudaEventCreate(&ev0));
+        CUDA_CHECK(cudaEventCreate(&ev1));
+        CUDA_CHECK(cudaEventCreate(&ev_total0));
+        CUDA_CHECK(cudaEventCreate(&ev_total1));
+        CUDA_CHECK(cudaEventRecord(ev_total0, stream_panel));
+    }
+    
+    CUDA_CHECK(cudaEventCreate(&ev_panel_done));
+    CUDA_CHECK(cudaEventCreate(&ev_exchange_done));
+    CUDA_CHECK(cudaEventCreate(&ev_trsm_done));
+
+    auto time_range = [&](cudaStream_t s, double* acc_ms, auto&& fn) {
+        if (!timers || !acc_ms) {
+            fn();
+            return;
+        }
+        CUDA_CHECK(cudaEventRecord(ev0, s));
+        fn();
+        CUDA_CHECK(cudaEventRecord(ev1, s));
+        CUDA_CHECK(cudaEventSynchronize(ev1));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ev0, ev1));
+        *acc_ms += (double)ms;
+    };
+
+    auto do_panel = [&](int j0, int ib_now) {
+        int uc_now = (uc > ib_now) ? ib_now : uc;
+        
+        time_range(stream_panel, timers ? &timers->panel_ms : nullptr, [&]() {
+            launch_panel_TSLU(dA, m, lda, j0, ib_now, uc_now, d_ipiv_rel, stream_panel);
+        });
+        
+        CUDA_CHECK(cudaMemcpyAsync(h_ipiv_rel, d_ipiv_rel,
+                                   sizeof(int) * ib_now,
+                                   cudaMemcpyDeviceToHost,
+                                   stream_panel));
+        CUDA_CHECK(cudaStreamSynchronize(stream_panel));
+        hgetrf_update_pivots_host(j0, ib_now, h_ipiv_rel, m, piv_rows);
+        if (timers) timers->panels += 1;
+        
+        CUDA_CHECK(cudaEventRecord(ev_panel_done, stream_panel));
+    };
+
+    auto do_exchange = [&](int j0, int ib_now) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream_exchange, ev_panel_done, 0));
+        
+        time_range(stream_exchange, timers ? &timers->exchange_ms : nullptr, [&]() {
+            launch_A_exchange_trailing(dA, m, n, lda, j0, ib_now, h_ipiv_rel, stream_exchange);
+        });
+        
+        CUDA_CHECK(cudaEventRecord(ev_exchange_done, stream_exchange));
+    };
+
+    auto do_trsm = [&](int j0, int ib_now) {
+        int col0   = j0 + ib_now;
+        int ntrail = n - col0;
+        if (ntrail <= 0 || ib_now <= 0) return;
+
+        CUDA_CHECK(cudaStreamWaitEvent(stream_trsm, ev_exchange_done, 0));
+
+        time_range(stream_trsm, timers ? &timers->trsm_ms : nullptr, [&]() {
+            if (config.trsm_mode == HgetrfConfig::TRSM_CUBLAS_HALF) {
+#if defined(CUBLAS_TRSM_ALGO_DEFAULT_TENSOR_OP)
+                const float alpha = 1.0f;
+                half* L11 = dA + j0 + (size_t)j0   * lda;
+                half* A12 = dA + j0 + (size_t)col0 * lda;
+                CUBLAS_CHECK(cublasSetStream(handle, stream_trsm));
+                CUBLAS_CHECK(
+                    cublasTrsmEx(
+                        handle,
+                        CUBLAS_SIDE_LEFT,
+                        CUBLAS_FILL_MODE_LOWER,
+                        CUBLAS_OP_N,
+                        CUBLAS_DIAG_UNIT,
+                        ib_now,
+                        ntrail,
+                        &alpha,
+                        L11, CUDA_R_16F, lda,
+                        A12, CUDA_R_16F, lda,
+                        A12, CUDA_R_16F, lda,
+                        CUDA_R_32F,
+                        CUBLAS_TRSM_ALGO_DEFAULT_TENSOR_OP));
+#else
+                launch_A12_trsm(dA, m, n, lda, j0, ib_now, stream_trsm);
+#endif
+            } else {
+                launch_A12_trsm(dA, m, n, lda, j0, ib_now, stream_trsm);
+            }
+        });
+        
+        CUDA_CHECK(cudaEventRecord(ev_trsm_done, stream_trsm));
+    };
+
+    auto do_gemm_range = [&](int j0, int ib_now, int col0, int n2) {
+        if (n2 <= 0 || ib_now <= 0) return;
+        
+        CUDA_CHECK(cudaStreamWaitEvent(stream_gemm, ev_trsm_done, 0));
+        
+        time_range(stream_gemm, timers ? &timers->gemm_ms : nullptr, [&]() {
+            if (config.use_tensor_core_gemm && handle) {
+                launch_A22_gemm_tc_range(dA, m, n, lda, j0, ib_now, col0, n2, handle, stream_gemm);
+            } else {
+                launch_A22_gemm_naive_range(dA, m, n, lda, j0, ib_now, col0, n2, stream_gemm);
+            }
+        });
+    };
+
+    auto do_gemm_full = [&](int j0, int ib_now) {
+        int col0 = j0 + ib_now;
+        int n2   = n - col0;
+        do_gemm_range(j0, ib_now, col0, n2);
+    };
+
+    // Pipeline with multi-stream overlap
+    do_panel(panel_j0[0], panel_ib[0]);
+
+    for (int k = 0; k < num_panels - 1; ++k) {
+        int j0   = panel_j0[k];
+        int ib_k = panel_ib[k];
+
+        int j0_next   = panel_j0[k+1];
+        int ib_next   = panel_ib[k+1];
+
+        // 启动多个stream并行
+        do_exchange(j0, ib_k);
+        do_trsm(j0, ib_k);
+        
+        {
+            int col0_next = j0 + ib_k;
+            int n2_next   = ib_next;
+            do_gemm_range(j0, ib_k, col0_next, n2_next);
+        }
+
+        do_panel(j0_next, ib_next);
+
+        {
+            int col0_tail = j0 + ib_k + ib_next;
+            int n2_tail   = n - col0_tail;
+            if (n2_tail > 0) {
+                do_gemm_range(j0, ib_k, col0_tail, n2_tail);
+            }
+        }
+    }
+
+    {
+        int k_last = num_panels - 1;
+        int j0_last = panel_j0[k_last];
+        int ib_last = panel_ib[k_last];
+
+        do_exchange(j0_last, ib_last);
+        do_trsm(j0_last, ib_last);
+        do_gemm_full(j0_last, ib_last);
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream_panel));
+    CUDA_CHECK(cudaStreamSynchronize(stream_exchange));
+    CUDA_CHECK(cudaStreamSynchronize(stream_trsm));
+    CUDA_CHECK(cudaStreamSynchronize(stream_gemm));
+
+    if (timers) {
+        CUDA_CHECK(cudaEventRecord(ev_total1, stream_panel));
+        CUDA_CHECK(cudaEventSynchronize(ev_total1));
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, ev_total0, ev_total1));
+        timers->total_ms = (double)ms;
+
+        CUDA_CHECK(cudaEventDestroy(ev0));
+        CUDA_CHECK(cudaEventDestroy(ev1));
+        CUDA_CHECK(cudaEventDestroy(ev_total0));
+        CUDA_CHECK(cudaEventDestroy(ev_total1));
+    }
+    
+    CUDA_CHECK(cudaEventDestroy(ev_panel_done));
+    CUDA_CHECK(cudaEventDestroy(ev_exchange_done));
+    CUDA_CHECK(cudaEventDestroy(ev_trsm_done));
+
+    CUDA_CHECK(cudaStreamDestroy(stream_panel));
+    CUDA_CHECK(cudaStreamDestroy(stream_exchange));
+    CUDA_CHECK(cudaStreamDestroy(stream_trsm));
+    CUDA_CHECK(cudaStreamDestroy(stream_gemm));
+}
+
+// ============================================================================
+// 原版双stream（保持不变）
 // ============================================================================
 
 inline void hgetrf_blocked_half_optimized(
@@ -393,18 +647,32 @@ inline void hgetrf_auto(
     }
     
     if (config.verbose) {
-        printf("[hgetrf_auto] Blocking mode (n=%d, panel_width=%d)\n", n, panel_width);
+        printf("[hgetrf_auto] %s mode (n=%d, panel_width=%d)\n",
+               config.use_multi_stream ? "Multi-stream" : "Dual-stream",
+               n, panel_width);
     }
     
-    hgetrf_blocked_half_optimized(dA, m, n, lda,
-                                  panel_width, uc,
-                                  handle,
-                                  d_ipiv_rel,
-                                  h_ipiv_rel,
-                                  piv_rows,
-                                  config,
-                                  stream,
-                                  timers);
+    if (config.use_multi_stream) {
+        hgetrf_blocked_half_multistream(dA, m, n, lda,
+                                       panel_width, uc,
+                                       handle,
+                                       d_ipiv_rel,
+                                       h_ipiv_rel,
+                                       piv_rows,
+                                       config,
+                                       stream,
+                                       timers);
+    } else {
+        hgetrf_blocked_half_optimized(dA, m, n, lda,
+                                      panel_width, uc,
+                                      handle,
+                                      d_ipiv_rel,
+                                      h_ipiv_rel,
+                                      piv_rows,
+                                      config,
+                                      stream,
+                                      timers);
+    }
 }
 
 // ============================================================================
@@ -430,6 +698,7 @@ inline void hgetrf_blocked_half(
                        HgetrfConfig::TRSM_CUBLAS_HALF : 
                        HgetrfConfig::TRSM_CUSTOM_KERNEL;
     config.verbose = false;
+    config.use_multi_stream = false;
     config.fixed_panel_width = (ib_pref > 0 && ib_pref <= MAX_PANEL_WIDTH) ? 
                                ib_pref : DEFAULT_PANEL_WIDTH;
     

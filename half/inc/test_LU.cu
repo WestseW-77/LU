@@ -282,6 +282,7 @@ TSTestResult test_matrix_lu(
         HgetrfConfig config;
         config.use_tensor_core_gemm = true;
         config.trsm_mode = HgetrfConfig::TRSM_CUSTOM_KERNEL;
+        config.use_multi_stream = true;  // ← 启用多流水线测试
         config.verbose = false;
         
         hgetrf_auto(dA_half, m, n, lda, 128, uc, handle,
