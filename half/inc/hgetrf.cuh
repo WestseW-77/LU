@@ -735,3 +735,305 @@ inline void hgetrf_blocked_half_ex(
                stream,
                timers);
 }
+
+// ============================================================================
+// cuSOLVER 风格兼容接口
+// ============================================================================
+
+/**
+ * hgetrf - 半精度 LU 分解（cuSOLVER 风格接口）
+ *
+ * 功能等价于 cusolverDnSgetrf，但使用半精度
+ *
+ * @param handle    cuBLAS handle（用于 Tensor Core GEMM）
+ * @param m         矩阵行数
+ * @param n         矩阵列数
+ * @param dA        设备端矩阵指针，分解后包含 L 和 U
+ * @param lda       leading dimension
+ * @param ipiv      设备端主元数组（输出，1-based 绝对索引，长度 min(m,n)）
+ *                  如果为 nullptr，则不返回主元信息（无主元分解）
+ * @param info      设备端状态信息（0 = 成功），可以为 nullptr
+ * @param stream    CUDA stream（可选）
+ * @param nb        面板宽度（可选，默认128）
+ *
+ * @return 0 成功，非0 失败
+ */
+inline int hgetrf(
+    cublasHandle_t handle,
+    int m, int n,
+    half* dA,
+    int lda,
+    int* ipiv,
+    int* info,
+    cudaStream_t stream = 0,
+    int nb = 128)
+{
+    // 参数检查
+    if (!dA) {
+        if (info) {
+            int h_info = -4;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return -4;
+    }
+    if (m < 0) {
+        if (info) {
+            int h_info = -2;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return -2;
+    }
+    if (n < 0) {
+        if (info) {
+            int h_info = -3;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return -3;
+    }
+    if (lda < std::max(1, m)) {
+        if (info) {
+            int h_info = -5;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return -5;
+    }
+    
+    // 空矩阵直接返回成功
+    if (m == 0 || n == 0) {
+        if (info) {
+            int h_info = 0;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return 0;
+    }
+
+    int minmn = std::min(m, n);
+    
+    // 分配临时缓冲区
+    int* d_ipiv_rel = nullptr;
+    int* h_ipiv_rel = nullptr;
+    int* piv_rows = nullptr;
+    
+    cudaError_t err = cudaMallocAsync(&d_ipiv_rel, sizeof(int) * minmn, stream);
+    if (err != cudaSuccess) {
+        if (info) {
+            int h_info = -100;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return -100;
+    }
+    
+    h_ipiv_rel = (int*)std::malloc(sizeof(int) * minmn);
+    piv_rows = (int*)std::malloc(sizeof(int) * m);
+    
+    if (!h_ipiv_rel || !piv_rows) {
+        if (d_ipiv_rel) cudaFreeAsync(d_ipiv_rel, stream);
+        if (h_ipiv_rel) std::free(h_ipiv_rel);
+        if (piv_rows) std::free(piv_rows);
+        if (info) {
+            int h_info = -101;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return -101;
+    }
+
+    // 配置
+    HgetrfConfig config;
+    config.use_tensor_core_gemm = (handle != nullptr);
+    config.trsm_mode = HgetrfConfig::TRSM_CUSTOM_KERNEL;
+    config.fixed_panel_width = nb;
+    config.verbose = false;
+    config.use_multi_stream = false;
+
+    // 执行分解
+    hgetrf_auto(dA, m, n, lda,
+               nb, nb,
+               handle,
+               d_ipiv_rel,
+               h_ipiv_rel,
+               piv_rows,
+               config,
+               stream,
+               nullptr);
+
+    // 转换主元索引到 1-based 绝对索引（与 cuSOLVER 兼容）
+    if (ipiv) {
+        std::vector<int> h_ipiv(minmn);
+        for (int i = 0; i < minmn; ++i) {
+            h_ipiv[i] = piv_rows[i] + 1;  // 1-based
+        }
+        cudaMemcpyAsync(ipiv, h_ipiv.data(),
+                        sizeof(int) * minmn,
+                        cudaMemcpyHostToDevice, stream);
+    }
+
+    // 设置 info = 0（成功）
+    if (info) {
+        int h_info = 0;
+        cudaMemcpyAsync(info, &h_info, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    }
+
+    // 同步并清理
+    cudaStreamSynchronize(stream);
+    cudaFreeAsync(d_ipiv_rel, stream);
+    std::free(h_ipiv_rel);
+    std::free(piv_rows);
+
+    return 0;
+}
+
+/**
+ * hgetrf_bufferSize - 获取工作空间大小（兼容接口）
+ *
+ * 注意：本实现内部自动分配，不需要外部工作空间
+ */
+inline int hgetrf_bufferSize(
+    cublasHandle_t handle,
+    int m, int n,
+    half* dA,
+    int lda,
+    int* lwork)
+{
+    (void)handle;
+    (void)m;
+    (void)n;
+    (void)dA;
+    (void)lda;
+    if (lwork) {
+        *lwork = 0;  // 内部自动分配，不需要外部工作空间
+    }
+    return 0;
+}
+
+/**
+ * hgetrf_simple - 最简接口（不返回主元信息）
+ *
+ * 适用于只需要分解结果，不关心主元的场景
+ */
+inline int hgetrf_simple(
+    half* dA,
+    int m, int n,
+    int lda,
+    cudaStream_t stream = 0,
+    int nb = 128)
+{
+    cublasHandle_t handle = nullptr;
+    cublasStatus_t st = cublasCreate(&handle);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        return -200;
+    }
+    cublasSetStream(handle, stream);
+    
+    int result = hgetrf(handle, m, n, dA, lda, nullptr, nullptr, stream, nb);
+    
+    cublasDestroy(handle);
+    return result;
+}
+
+/**
+ * hgetrf_with_timers - 带计时的接口
+ *
+ * 用于性能分析
+ */
+inline int hgetrf_with_timers(
+    cublasHandle_t handle,
+    int m, int n,
+    half* dA,
+    int lda,
+    int* ipiv,
+    int* info,
+    HgetrfTimers* timers,
+    cudaStream_t stream = 0,
+    int nb = 128)
+{
+    // 参数检查
+    if (!dA) {
+        if (info) {
+            int h_info = -4;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return -4;
+    }
+    if (m <= 0 || n <= 0) {
+        if (info) {
+            int h_info = 0;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return 0;
+    }
+    if (lda < m) {
+        if (info) {
+            int h_info = -5;
+            cudaMemcpyAsync(info, &h_info, sizeof(int), cudaMemcpyHostToDevice, stream);
+        }
+        return -5;
+    }
+
+    int minmn = std::min(m, n);
+    
+    // 分配临时缓冲区
+    int* d_ipiv_rel = nullptr;
+    int* h_ipiv_rel = nullptr;
+    int* piv_rows = nullptr;
+    
+    cudaError_t err = cudaMallocAsync(&d_ipiv_rel, sizeof(int) * minmn, stream);
+    if (err != cudaSuccess) {
+        return -100;
+    }
+    
+    h_ipiv_rel = (int*)std::malloc(sizeof(int) * minmn);
+    piv_rows = (int*)std::malloc(sizeof(int) * m);
+    
+    if (!h_ipiv_rel || !piv_rows) {
+        if (d_ipiv_rel) cudaFreeAsync(d_ipiv_rel, stream);
+        if (h_ipiv_rel) std::free(h_ipiv_rel);
+        if (piv_rows) std::free(piv_rows);
+        return -101;
+    }
+
+    // 配置
+    HgetrfConfig config;
+    config.use_tensor_core_gemm = (handle != nullptr);
+    config.trsm_mode = HgetrfConfig::TRSM_CUSTOM_KERNEL;
+    config.fixed_panel_width = nb;
+    config.verbose = false;
+    config.use_multi_stream = false;
+
+    // 执行分解（带计时）
+    hgetrf_auto(dA, m, n, lda,
+               nb, nb,
+               handle,
+               d_ipiv_rel,
+               h_ipiv_rel,
+               piv_rows,
+               config,
+               stream,
+               timers);
+
+    // 转换主元索引
+    if (ipiv) {
+        std::vector<int> h_ipiv(minmn);
+        for (int i = 0; i < minmn; ++i) {
+            h_ipiv[i] = piv_rows[i] + 1;
+        }
+        cudaMemcpyAsync(ipiv, h_ipiv.data(),
+                        sizeof(int) * minmn,
+                        cudaMemcpyHostToDevice, stream);
+    }
+
+    // 设置 info
+    if (info) {
+        int h_info = 0;
+        cudaMemcpyAsync(info, &h_info, sizeof(int),
+                        cudaMemcpyHostToDevice, stream);
+    }
+
+    // 同步并清理
+    cudaStreamSynchronize(stream);
+    cudaFreeAsync(d_ipiv_rel, stream);
+    std::free(h_ipiv_rel);
+    std::free(piv_rows);
+
+    return 0;
+}
