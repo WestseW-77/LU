@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <algorithm>
 
 #include "A1_panel.cuh"
 #include "A_exchange.cuh"
@@ -45,19 +46,19 @@ using half = __half;
 
 struct HgetrfConfig {
     bool use_tensor_core_gemm = true;
-    
+
     enum TrsmMode {
         TRSM_CUSTOM_KERNEL,
         TRSM_CUBLAS_HALF,
         TRSM_CUBLAS_FLOAT
     };
     TrsmMode trsm_mode = TRSM_CUSTOM_KERNEL;
-    
+
     bool use_batched_exchange = true;
     bool use_multi_stream = false;  // 新增：启用多流水线
     bool verbose = false;
     bool check_errors = false;
-    
+
     int fixed_panel_width = 128;
 };
 
@@ -156,11 +157,18 @@ inline void hgetrf_blocked_half_multistream(
     cudaStream_t stream_exchange = nullptr;
     cudaStream_t stream_trsm = nullptr;
     cudaStream_t stream_gemm = nullptr;
-    
+
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_panel, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_exchange, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_trsm, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_gemm, cudaStreamNonBlocking));
+
+    // ---- NEW: panel workspace allocated once and reused ----
+    const int num_blocks_pivot_max = panel_TSLU_required_pivot_blocks(m, /*j0=*/0);
+    half* d_panel_block_val = nullptr;
+    int*  d_panel_block_idx = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_panel_block_val, sizeof(half) * (size_t)num_blocks_pivot_max));
+    CUDA_CHECK(cudaMalloc(&d_panel_block_idx, sizeof(int)  * (size_t)num_blocks_pivot_max));
 
     // Events for synchronization
     cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev_total0 = nullptr, ev_total1 = nullptr;
@@ -176,7 +184,7 @@ inline void hgetrf_blocked_half_multistream(
         CUDA_CHECK(cudaEventCreate(&ev_total1));
         CUDA_CHECK(cudaEventRecord(ev_total0, stream_panel));
     }
-    
+
     CUDA_CHECK(cudaEventCreate(&ev_panel_done));
     CUDA_CHECK(cudaEventCreate(&ev_exchange_done));
     CUDA_CHECK(cudaEventCreate(&ev_trsm_done));
@@ -197,29 +205,31 @@ inline void hgetrf_blocked_half_multistream(
 
     auto do_panel = [&](int j0, int ib_now) {
         int uc_now = (uc > ib_now) ? ib_now : uc;
-        
+
         time_range(stream_panel, timers ? &timers->panel_ms : nullptr, [&]() {
-            launch_panel_TSLU(dA, m, lda, j0, ib_now, uc_now, d_ipiv_rel, stream_panel);
+            launch_panel_TSLU(
+                dA, m, lda, j0, ib_now, uc_now, d_ipiv_rel, stream_panel,
+                d_panel_block_val, d_panel_block_idx, num_blocks_pivot_max);
         });
-        
+
         CUDA_CHECK(cudaMemcpyAsync(h_ipiv_rel, d_ipiv_rel,
-                                   sizeof(int) * ib_now,
+                                   sizeof(int) * (size_t)ib_now,
                                    cudaMemcpyDeviceToHost,
                                    stream_panel));
         CUDA_CHECK(cudaStreamSynchronize(stream_panel));
         hgetrf_update_pivots_host(j0, ib_now, h_ipiv_rel, m, piv_rows);
         if (timers) timers->panels += 1;
-        
+
         CUDA_CHECK(cudaEventRecord(ev_panel_done, stream_panel));
     };
 
     auto do_exchange = [&](int j0, int ib_now) {
         CUDA_CHECK(cudaStreamWaitEvent(stream_exchange, ev_panel_done, 0));
-        
+
         time_range(stream_exchange, timers ? &timers->exchange_ms : nullptr, [&]() {
             launch_A_exchange_trailing(dA, m, n, lda, j0, ib_now, h_ipiv_rel, stream_exchange);
         });
-        
+
         CUDA_CHECK(cudaEventRecord(ev_exchange_done, stream_exchange));
     };
 
@@ -259,15 +269,15 @@ inline void hgetrf_blocked_half_multistream(
                 launch_A12_trsm(dA, m, n, lda, j0, ib_now, stream_trsm);
             }
         });
-        
+
         CUDA_CHECK(cudaEventRecord(ev_trsm_done, stream_trsm));
     };
 
     auto do_gemm_range = [&](int j0, int ib_now, int col0, int n2) {
         if (n2 <= 0 || ib_now <= 0) return;
-        
+
         CUDA_CHECK(cudaStreamWaitEvent(stream_gemm, ev_trsm_done, 0));
-        
+
         time_range(stream_gemm, timers ? &timers->gemm_ms : nullptr, [&]() {
             if (config.use_tensor_core_gemm && handle) {
                 launch_A22_gemm_tc_range(dA, m, n, lda, j0, ib_now, col0, n2, handle, stream_gemm);
@@ -296,7 +306,7 @@ inline void hgetrf_blocked_half_multistream(
         // 启动多个stream并行
         do_exchange(j0, ib_k);
         do_trsm(j0, ib_k);
-        
+
         {
             int col0_next = j0 + ib_k;
             int n2_next   = ib_next;
@@ -341,10 +351,14 @@ inline void hgetrf_blocked_half_multistream(
         CUDA_CHECK(cudaEventDestroy(ev_total0));
         CUDA_CHECK(cudaEventDestroy(ev_total1));
     }
-    
+
     CUDA_CHECK(cudaEventDestroy(ev_panel_done));
     CUDA_CHECK(cudaEventDestroy(ev_exchange_done));
     CUDA_CHECK(cudaEventDestroy(ev_trsm_done));
+
+    // ---- NEW: free workspace ----
+    CUDA_CHECK(cudaFree(d_panel_block_val));
+    CUDA_CHECK(cudaFree(d_panel_block_idx));
 
     CUDA_CHECK(cudaStreamDestroy(stream_panel));
     CUDA_CHECK(cudaStreamDestroy(stream_exchange));
@@ -353,7 +367,7 @@ inline void hgetrf_blocked_half_multistream(
 }
 
 // ============================================================================
-// 原版双stream（保持不变）
+// 原版双stream（保持结构不变，仅改 panel 调用增加 workspace）
 // ============================================================================
 
 inline void hgetrf_blocked_half_optimized(
@@ -409,6 +423,13 @@ inline void hgetrf_blocked_half_optimized(
     cudaStream_t stream_panel  = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream_panel, cudaStreamNonBlocking));
 
+    // ---- NEW: panel workspace allocated once and reused ----
+    const int num_blocks_pivot_max = panel_TSLU_required_pivot_blocks(m, /*j0=*/0);
+    half* d_panel_block_val = nullptr;
+    int*  d_panel_block_idx = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_panel_block_val, sizeof(half) * (size_t)num_blocks_pivot_max));
+    CUDA_CHECK(cudaMalloc(&d_panel_block_idx, sizeof(int)  * (size_t)num_blocks_pivot_max));
+
     cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev_total0 = nullptr, ev_total1 = nullptr;
     cudaEvent_t ev_next_ready = nullptr;
 
@@ -440,13 +461,15 @@ inline void hgetrf_blocked_half_optimized(
 
     auto do_panel = [&](int j0, int ib_now) {
         int uc_now = (uc > ib_now) ? ib_now : uc;
-        
+
         time_range(stream_panel, timers ? &timers->panel_ms : nullptr, [&]() {
-            launch_panel_TSLU(dA, m, lda, j0, ib_now, uc_now, d_ipiv_rel, stream_panel);
+            launch_panel_TSLU(
+                dA, m, lda, j0, ib_now, uc_now, d_ipiv_rel, stream_panel,
+                d_panel_block_val, d_panel_block_idx, num_blocks_pivot_max);
         });
-        
+
         CUDA_CHECK(cudaMemcpyAsync(h_ipiv_rel, d_ipiv_rel,
-                                   sizeof(int) * ib_now,
+                                   sizeof(int) * (size_t)ib_now,
                                    cudaMemcpyDeviceToHost,
                                    stream_panel));
         CUDA_CHECK(cudaStreamSynchronize(stream_panel));
@@ -574,6 +597,10 @@ inline void hgetrf_blocked_half_optimized(
         CUDA_CHECK(cudaEventDestroy(ev_next_ready));
     }
 
+    // ---- NEW: free workspace ----
+    CUDA_CHECK(cudaFree(d_panel_block_val));
+    CUDA_CHECK(cudaFree(d_panel_block_idx));
+
     CUDA_CHECK(cudaStreamDestroy(stream_panel));
 }
 
@@ -610,20 +637,29 @@ inline void hgetrf_auto(
         if (config.verbose) {
             printf("[hgetrf_auto] Single panel mode (n=%d)\n", n);
         }
-        
+
         for (int i = 0; i < m; ++i) {
             piv_rows[i] = i;
         }
-        
+
+        // ---- NEW: workspace for single-panel case ----
+        const int num_blocks_pivot_max = panel_TSLU_required_pivot_blocks(m, /*j0=*/0);
+        half* d_panel_block_val = nullptr;
+        int*  d_panel_block_idx = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_panel_block_val, sizeof(half) * (size_t)num_blocks_pivot_max));
+        CUDA_CHECK(cudaMalloc(&d_panel_block_idx, sizeof(int)  * (size_t)num_blocks_pivot_max));
+
         cudaEvent_t ev0 = nullptr, ev1 = nullptr;
         if (timers) {
             CUDA_CHECK(cudaEventCreate(&ev0));
             CUDA_CHECK(cudaEventCreate(&ev1));
             CUDA_CHECK(cudaEventRecord(ev0, stream));
         }
-        
-        launch_panel_TSLU(dA, m, lda, 0, n, uc, d_ipiv_rel, stream);
-        
+
+        launch_panel_TSLU(
+            dA, m, lda, 0, n, uc, d_ipiv_rel, stream,
+            d_panel_block_val, d_panel_block_idx, num_blocks_pivot_max);
+
         if (timers) {
             CUDA_CHECK(cudaEventRecord(ev1, stream));
             CUDA_CHECK(cudaEventSynchronize(ev1));
@@ -635,23 +671,27 @@ inline void hgetrf_auto(
             CUDA_CHECK(cudaEventDestroy(ev0));
             CUDA_CHECK(cudaEventDestroy(ev1));
         }
-        
+
         CUDA_CHECK(cudaMemcpyAsync(h_ipiv_rel, d_ipiv_rel,
-                                   sizeof(int) * n,
+                                   sizeof(int) * (size_t)n,
                                    cudaMemcpyDeviceToHost,
                                    stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         hgetrf_update_pivots_host(0, n, h_ipiv_rel, m, piv_rows);
-        
+
+        // ---- NEW: free workspace ----
+        CUDA_CHECK(cudaFree(d_panel_block_val));
+        CUDA_CHECK(cudaFree(d_panel_block_idx));
+
         return;
     }
-    
+
     if (config.verbose) {
         printf("[hgetrf_auto] %s mode (n=%d, panel_width=%d)\n",
                config.use_multi_stream ? "Multi-stream" : "Dual-stream",
                n, panel_width);
     }
-    
+
     if (config.use_multi_stream) {
         hgetrf_blocked_half_multistream(dA, m, n, lda,
                                        panel_width, uc,
@@ -694,14 +734,14 @@ inline void hgetrf_blocked_half(
 {
     HgetrfConfig config;
     config.use_tensor_core_gemm = use_cublas_tc;
-    config.trsm_mode = use_cublas_trsm ? 
-                       HgetrfConfig::TRSM_CUBLAS_HALF : 
+    config.trsm_mode = use_cublas_trsm ?
+                       HgetrfConfig::TRSM_CUBLAS_HALF :
                        HgetrfConfig::TRSM_CUSTOM_KERNEL;
     config.verbose = false;
     config.use_multi_stream = false;
-    config.fixed_panel_width = (ib_pref > 0 && ib_pref <= MAX_PANEL_WIDTH) ? 
+    config.fixed_panel_width = (ib_pref > 0 && ib_pref <= MAX_PANEL_WIDTH) ?
                                ib_pref : DEFAULT_PANEL_WIDTH;
-    
+
     hgetrf_auto(dA, m, n, lda,
                ib_pref, uc,
                handle,
@@ -740,24 +780,6 @@ inline void hgetrf_blocked_half_ex(
 // cuSOLVER 风格兼容接口
 // ============================================================================
 
-/**
- * hgetrf - 半精度 LU 分解（cuSOLVER 风格接口）
- *
- * 功能等价于 cusolverDnSgetrf，但使用半精度
- *
- * @param handle    cuBLAS handle（用于 Tensor Core GEMM）
- * @param m         矩阵行数
- * @param n         矩阵列数
- * @param dA        设备端矩阵指针，分解后包含 L 和 U
- * @param lda       leading dimension
- * @param ipiv      设备端主元数组（输出，1-based 绝对索引，长度 min(m,n)）
- *                  如果为 nullptr，则不返回主元信息（无主元分解）
- * @param info      设备端状态信息（0 = 成功），可以为 nullptr
- * @param stream    CUDA stream（可选）
- * @param nb        面板宽度（可选，默认128）
- *
- * @return 0 成功，非0 失败
- */
 inline int hgetrf(
     cublasHandle_t handle,
     int m, int n,
@@ -768,7 +790,6 @@ inline int hgetrf(
     cudaStream_t stream = 0,
     int nb = 128)
 {
-    // 参数检查
     if (!dA) {
         if (info) {
             int h_info = -4;
@@ -797,8 +818,7 @@ inline int hgetrf(
         }
         return -5;
     }
-    
-    // 空矩阵直接返回成功
+
     if (m == 0 || n == 0) {
         if (info) {
             int h_info = 0;
@@ -808,13 +828,12 @@ inline int hgetrf(
     }
 
     int minmn = std::min(m, n);
-    
-    // 分配临时缓冲区
+
     int* d_ipiv_rel = nullptr;
     int* h_ipiv_rel = nullptr;
     int* piv_rows = nullptr;
-    
-    cudaError_t err = cudaMallocAsync(&d_ipiv_rel, sizeof(int) * minmn, stream);
+
+    cudaError_t err = cudaMallocAsync(&d_ipiv_rel, sizeof(int) * (size_t)minmn, stream);
     if (err != cudaSuccess) {
         if (info) {
             int h_info = -100;
@@ -822,10 +841,10 @@ inline int hgetrf(
         }
         return -100;
     }
-    
-    h_ipiv_rel = (int*)std::malloc(sizeof(int) * minmn);
-    piv_rows = (int*)std::malloc(sizeof(int) * m);
-    
+
+    h_ipiv_rel = (int*)std::malloc(sizeof(int) * (size_t)minmn);
+    piv_rows   = (int*)std::malloc(sizeof(int) * (size_t)m);
+
     if (!h_ipiv_rel || !piv_rows) {
         if (d_ipiv_rel) cudaFreeAsync(d_ipiv_rel, stream);
         if (h_ipiv_rel) std::free(h_ipiv_rel);
@@ -837,7 +856,6 @@ inline int hgetrf(
         return -101;
     }
 
-    // 配置
     HgetrfConfig config;
     config.use_tensor_core_gemm = (handle != nullptr);
     config.trsm_mode = HgetrfConfig::TRSM_CUSTOM_KERNEL;
@@ -845,7 +863,6 @@ inline int hgetrf(
     config.verbose = false;
     config.use_multi_stream = false;
 
-    // 执行分解
     hgetrf_auto(dA, m, n, lda,
                nb, nb,
                handle,
@@ -856,25 +873,22 @@ inline int hgetrf(
                stream,
                nullptr);
 
-    // 转换主元索引到 1-based 绝对索引（与 cuSOLVER 兼容）
     if (ipiv) {
         std::vector<int> h_ipiv(minmn);
         for (int i = 0; i < minmn; ++i) {
-            h_ipiv[i] = piv_rows[i] + 1;  // 1-based
+            h_ipiv[i] = piv_rows[i] + 1;
         }
         cudaMemcpyAsync(ipiv, h_ipiv.data(),
-                        sizeof(int) * minmn,
+                        sizeof(int) * (size_t)minmn,
                         cudaMemcpyHostToDevice, stream);
     }
 
-    // 设置 info = 0（成功）
     if (info) {
         int h_info = 0;
         cudaMemcpyAsync(info, &h_info, sizeof(int),
                         cudaMemcpyHostToDevice, stream);
     }
 
-    // 同步并清理
     cudaStreamSynchronize(stream);
     cudaFreeAsync(d_ipiv_rel, stream);
     std::free(h_ipiv_rel);
@@ -883,11 +897,6 @@ inline int hgetrf(
     return 0;
 }
 
-/**
- * hgetrf_bufferSize - 获取工作空间大小（兼容接口）
- *
- * 注意：本实现内部自动分配，不需要外部工作空间
- */
 inline int hgetrf_bufferSize(
     cublasHandle_t handle,
     int m, int n,
@@ -901,16 +910,11 @@ inline int hgetrf_bufferSize(
     (void)dA;
     (void)lda;
     if (lwork) {
-        *lwork = 0;  // 内部自动分配，不需要外部工作空间
+        *lwork = 0;
     }
     return 0;
 }
 
-/**
- * hgetrf_simple - 最简接口（不返回主元信息）
- *
- * 适用于只需要分解结果，不关心主元的场景
- */
 inline int hgetrf_simple(
     half* dA,
     int m, int n,
@@ -924,18 +928,13 @@ inline int hgetrf_simple(
         return -200;
     }
     cublasSetStream(handle, stream);
-    
+
     int result = hgetrf(handle, m, n, dA, lda, nullptr, nullptr, stream, nb);
-    
+
     cublasDestroy(handle);
     return result;
 }
 
-/**
- * hgetrf_with_timers - 带计时的接口
- *
- * 用于性能分析
- */
 inline int hgetrf_with_timers(
     cublasHandle_t handle,
     int m, int n,
@@ -947,7 +946,6 @@ inline int hgetrf_with_timers(
     cudaStream_t stream = 0,
     int nb = 128)
 {
-    // 参数检查
     if (!dA) {
         if (info) {
             int h_info = -4;
@@ -971,20 +969,19 @@ inline int hgetrf_with_timers(
     }
 
     int minmn = std::min(m, n);
-    
-    // 分配临时缓冲区
+
     int* d_ipiv_rel = nullptr;
     int* h_ipiv_rel = nullptr;
     int* piv_rows = nullptr;
-    
-    cudaError_t err = cudaMallocAsync(&d_ipiv_rel, sizeof(int) * minmn, stream);
+
+    cudaError_t err = cudaMallocAsync(&d_ipiv_rel, sizeof(int) * (size_t)minmn, stream);
     if (err != cudaSuccess) {
         return -100;
     }
-    
-    h_ipiv_rel = (int*)std::malloc(sizeof(int) * minmn);
-    piv_rows = (int*)std::malloc(sizeof(int) * m);
-    
+
+    h_ipiv_rel = (int*)std::malloc(sizeof(int) * (size_t)minmn);
+    piv_rows   = (int*)std::malloc(sizeof(int) * (size_t)m);
+
     if (!h_ipiv_rel || !piv_rows) {
         if (d_ipiv_rel) cudaFreeAsync(d_ipiv_rel, stream);
         if (h_ipiv_rel) std::free(h_ipiv_rel);
@@ -992,7 +989,6 @@ inline int hgetrf_with_timers(
         return -101;
     }
 
-    // 配置
     HgetrfConfig config;
     config.use_tensor_core_gemm = (handle != nullptr);
     config.trsm_mode = HgetrfConfig::TRSM_CUSTOM_KERNEL;
@@ -1000,7 +996,6 @@ inline int hgetrf_with_timers(
     config.verbose = false;
     config.use_multi_stream = false;
 
-    // 执行分解（带计时）
     hgetrf_auto(dA, m, n, lda,
                nb, nb,
                handle,
@@ -1011,25 +1006,22 @@ inline int hgetrf_with_timers(
                stream,
                timers);
 
-    // 转换主元索引
     if (ipiv) {
         std::vector<int> h_ipiv(minmn);
         for (int i = 0; i < minmn; ++i) {
             h_ipiv[i] = piv_rows[i] + 1;
         }
         cudaMemcpyAsync(ipiv, h_ipiv.data(),
-                        sizeof(int) * minmn,
+                        sizeof(int) * (size_t)minmn,
                         cudaMemcpyHostToDevice, stream);
     }
 
-    // 设置 info
     if (info) {
         int h_info = 0;
         cudaMemcpyAsync(info, &h_info, sizeof(int),
                         cudaMemcpyHostToDevice, stream);
     }
 
-    // 同步并清理
     cudaStreamSynchronize(stream);
     cudaFreeAsync(d_ipiv_rel, stream);
     std::free(h_ipiv_rel);

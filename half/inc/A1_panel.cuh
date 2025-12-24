@@ -10,29 +10,6 @@
 
 namespace cg = cooperative_groups;
 
-/**
- * ============================================================================
- * A1_panel.cuh  (cooperative pivot+pre-swap scale) + (swap) + (update)
- * ============================================================================
- *
- * 本版本相对你“缓存U+缓存L + float inv_pivot”的版本，按更稳的方向收敛：
- *
- * 1) pre-swap scale：恢复为 half 除法（去掉 half<->float 转换与 float 乘法）
- *    - 保持你之前的数值/指令路径，更便于对比性能
- *
- * 2) update：只缓存 U 行（tile_c 个 U[k,c]）到 shared
- *    - 不缓存 L（避免为 L 增加 shared 写/读/额外开销）
- *    - 每个线程仍直接从 global 读取 L = A[r,col_k]
- *
- * 目标：减少 update 中“U 行重复被 tile_r=32 个线程反复读取”的 global load，
- * 同时把新增开销控制到最小。
- *
- * 约束：
- * - A 全程 half 存储/写回
- * - launch_panel_TSLU 签名不变
- * - 仅 cooperative 路线（无 fallback）
- */
-
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
@@ -51,39 +28,32 @@ namespace cg = cooperative_groups;
 
 static __device__ __forceinline__ half half_abs(half x) { return __habs(x); }
 
-// ----------------------------------------------------------------------------
-// Workspace（复用 block_val/block_idx）
-// 注意：默认不会多线程/多 stream 并发调用同一个 TU 的 workspace。
-// ----------------------------------------------------------------------------
-namespace panel_ws {
-    inline half* g_block_val = nullptr;
-    inline int*  g_block_idx = nullptr;
-    inline int   g_capacity  = 0;
+/**
+ * ============================================================================
+ * 本文件对外接口变更（按你的要求）：
+ *
+ * 1) 提供接口：计算 pivot workspace 需要的元素数（以及 bytes）
+ *    - 由外部提前 cudaMalloc 并在多次调用中复用
+ *
+ * 2) launch_panel_TSLU 仍保留原名字，但参数新增/替换为外部传入 workspace
+ *    - 不再在函数内部 cudaMalloc/cudaFree
+ *    - 不再使用静态全局 workspace
+ *
+ * 3) 仅 cooperative 路线（4090/更新设备），无 fallback
+ * ============================================================================
+ */
 
-    inline void ensure_capacity(int needed) {
-        if (needed <= g_capacity) return;
-
-        if (g_block_val) CUDA_CHECK(cudaFree(g_block_val));
-        if (g_block_idx) CUDA_CHECK(cudaFree(g_block_idx));
-
-        CUDA_CHECK(cudaMalloc(&g_block_val, sizeof(half) * (size_t)needed));
-        CUDA_CHECK(cudaMalloc(&g_block_idx, sizeof(int)  * (size_t)needed));
-        g_capacity = needed;
-    }
-} // namespace panel_ws
-
-// ----------------------------------------------------------------------------
-// Cooperative kernel：pivot(search+reduce) + pre-swap scale（按你的“先除再换”规则）
-// pre-swap scale：使用 half 除法（不引入 float inv）
-// ----------------------------------------------------------------------------
+// -------------------------------------------
+// 设备侧：cooperative pivot + pre-swap scale
+// -------------------------------------------
 __global__ void panel_pivot_and_prescale_coop_kernel(
     half* __restrict__ A,
     int m, int lda,
     int j0, int k,
-    half* __restrict__ block_val,
-    int*  __restrict__ block_idx,
+    half* __restrict__ block_val, // 每个 block 选择到的最大值
+    int*  __restrict__ block_idx, // 每个 block 选择到的最大值的索引
     int num_blocks,
-    int* __restrict__ d_ipiv_rel)
+    int* __restrict__ d_ipiv_rel) // pivot 结果的相对偏移量
 {
     extern __shared__ unsigned char smem[];
     const int tid = threadIdx.x;
@@ -91,17 +61,18 @@ __global__ void panel_pivot_and_prescale_coop_kernel(
     const int warp_id = tid / WARP_SIZE;
     const int num_warps = blockDim.x / WARP_SIZE;
 
-    // shared：按 threads 的 half+int 给足，用于 block0 最终 reduce
+    // 前半段放具体的数值，后半段放对应的索引
     half* s_val = reinterpret_cast<half*>(smem);
     int*  s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
 
+    // 当前处理的列号
     const int col_k = j0 + k;
+    // 对角线行号
     const int row_k = j0 + k;
-    if (col_k >= m) return;
+    if (col_k >= m) 
+        return;
 
-    // -------------------------
-    // Phase 1: 每个 block 求 block max（写到 block_val/block_idx）
-    // -------------------------
+    // 每个 block 找自己负责数据中的最大值
     half local_max_val = __float2half(0.0f);
     int  local_max_idx = row_k;
 
@@ -115,6 +86,7 @@ __global__ void panel_pivot_and_prescale_coop_kernel(
         }
     }
 
+    // warp 级别 reduce，得到每个 warp 内的最大值
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         half other_val = __shfl_down_sync(0xffffffff, local_max_val, offset);
         int  other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
@@ -124,14 +96,14 @@ __global__ void panel_pivot_and_prescale_coop_kernel(
         }
     }
 
-    // shared 前 num_warps 槽位暂存 warp 结果（复用 s_val/s_idx 前段）
     if (lane == 0) {
         s_val[warp_id] = local_max_val;
         s_idx[warp_id] = local_max_idx;
     }
+    // [question] 这个同步是不是少了一级
     __syncthreads();
 
-    // warp0 reduce 得到 block max
+    // warp0 规约，把不同 warp 内的最大值规约成为 block 最大值
     if (warp_id == 0) {
         half warp_max = (lane < num_warps) ? s_val[lane] : __float2half(0.0f);
         int  warp_idx = (lane < num_warps) ? s_idx[lane] : row_k;
@@ -154,13 +126,12 @@ __global__ void panel_pivot_and_prescale_coop_kernel(
     cg::grid_group grid = cg::this_grid();
     grid.sync();
 
-    // -------------------------
-    // Phase 2: block0 最终 reduce -> d_ipiv_rel[k]
-    // -------------------------
+    // 选出所有 block 加在一起的最大值，并写入数组中传出，只由第一个 block 进行操作
     if (blockIdx.x == 0) {
         half max_val = __float2half(0.0f);
         int  max_idx = row_k;
 
+        // 同理，先选出每个线程接触到的最大值，存入 shared memory
         for (int i = tid; i < num_blocks; i += blockDim.x) {
             half v = block_val[i];
             int  r = block_idx[i];
@@ -174,6 +145,7 @@ __global__ void panel_pivot_and_prescale_coop_kernel(
         s_idx[tid] = max_idx;
         __syncthreads();
 
+        // 再做一次 reduce 得到最终的最大值
         for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
             if (tid < stride) {
                 if (s_val[tid + stride] > s_val[tid]) {
@@ -184,6 +156,7 @@ __global__ void panel_pivot_and_prescale_coop_kernel(
             __syncthreads();
         }
 
+        // 传出的索引是相对位置，这里会是需要统一的地方 [fix]
         if (tid == 0) {
             d_ipiv_rel[k] = s_idx[0] - row_k;
         }
@@ -191,34 +164,32 @@ __global__ void panel_pivot_and_prescale_coop_kernel(
 
     grid.sync();
 
-    // -------------------------
-    // Phase 3: pre-swap scale（half 除法版本）
-    // -------------------------
+    // 这里进行了顺序调整，选择先进行高斯消元再进行 pivot 最终的 exchange 操作
     const int rel = d_ipiv_rel[k];
     const int pivot_row = row_k + rel;
 
     const half pivot = A[pivot_row + (size_t)col_k * lda];
-    if (pivot == __float2half(0.0f)) return;
+    if (pivot == __float2half(0.0f)) 
+        return;
 
+    // 这边的除法可能是可以优化数值精度的地方 [fix]
     if (pivot_row == row_k) {
-        // 标准：r = row_k+1..m-1
+        // 如果 pivot 行就是对角线行，那么直接进行高斯消元
         for (int r = row_k + 1 + blockIdx.x * blockDim.x + tid; r < m; r += global_stride) {
             half val = A[r + (size_t)col_k * lda];
             A[r + (size_t)col_k * lda] = val / pivot;
         }
     } else {
-        // 预交换缩放：r = row_k..m-1 且 r != pivot_row
         for (int r = row_k + blockIdx.x * blockDim.x + tid; r < m; r += global_stride) {
-            if (r == pivot_row) continue;
+            if (r == pivot_row) 
+                continue;
             half val = A[r + (size_t)col_k * lda];
             A[r + (size_t)col_k * lda] = val / pivot;
         }
     }
 }
 
-// ----------------------------------------------------------------------------
-// swap kernel：panel 内列范围交换 row_k 与 pivot_row
-// ----------------------------------------------------------------------------
+// 对 pivot 结果进行交换 ，目前是每个线程都只交换了一个数据，拉更多的 block 参加 [fix]
 __global__ void panel_row_swap_kernel(
     half* __restrict__ A,
     int m, int lda,
@@ -226,25 +197,27 @@ __global__ void panel_row_swap_kernel(
     int k,
     const int* __restrict__ d_ipiv_rel)
 {
-    int col_k = j0 + k;
-    if (col_k >= m) return;
+    const int col_k = j0 + k;
+    if (col_k >= m) 
+        return;
+    // 当前的行号
+    const int row_k = j0 + k;
+    // 目标交换的行号
+    const int pivot_row = row_k + d_ipiv_rel[k];
+    if (pivot_row == row_k) 
+        return;
+    // 自己负责交换的行号
+    const int j = j0 + blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= j0 + ib) 
+        return;
 
-    int row_k = j0 + k;
-    int pivot_row = row_k + d_ipiv_rel[k];
-    if (pivot_row == row_k) return;
-
-    int j = j0 + blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= j0 + ib) return;
-
-    size_t col_offset = (size_t)j * lda;
-    half tmp = A[row_k + col_offset];
-    A[row_k + col_offset] = A[pivot_row + col_offset];
-    A[pivot_row + col_offset] = tmp;
+    const size_t col_off = (size_t)j * lda;
+    const half tmp = A[row_k + col_off];
+    A[row_k + col_off] = A[pivot_row + col_off];
+    A[pivot_row + col_off] = tmp;
 }
 
-// ----------------------------------------------------------------------------
-// update kernel（只缓存 U 行）：减少 U 被 tile_r 重复读的 global load
-// ----------------------------------------------------------------------------
+// 对操作后的矩阵右边进行更新
 __global__ void panel_update_kernel_cacheU(
     half* __restrict__ A,
     int m, int lda,
@@ -253,84 +226,68 @@ __global__ void panel_update_kernel_cacheU(
 {
     const int col_k = j0 + k;
     const int row_k = j0 + k;
+    // 更新的列的起始与结束位置
     const int col_start = col_k + 1;
     const int col_end   = j0 + ib;
+    if (col_k >= m) 
+        return;
 
-    if (col_k >= m) return;
+    // 因为这里目前选用的二维的，所以要根据形状来进行处理
+    const int tile_col = (int)blockDim.x;
+    const int tile_row = (int)blockDim.y;
 
-    // blockDim = (tile_c, tile_r)
-    const int tile_c = (int)blockDim.x;
-    const int tile_r = (int)blockDim.y;
+    const int c0 = col_start + blockIdx.x * tile_col;
+    const int r  = row_k + 1 + blockIdx.y * tile_row + threadIdx.y;
+    const int c  = c0 + threadIdx.x;
 
-    const int c0 = col_start + blockIdx.x * tile_c;
-
-    const int r = row_k + 1 + blockIdx.y * tile_r + threadIdx.y;
-    const int c = c0 + threadIdx.x;
-
-    // shared: U tile（tile_c 个 half）
     extern __shared__ unsigned char smem[];
-    half* sU = reinterpret_cast<half*>(smem);  // [tile_c]
+    // 这里读入了每个 tile 内的行的四个值，用于加速访问
+    half* sU = reinterpret_cast<half*>(smem);
 
-    // 只让 threadIdx.y==0 的一行线程加载 U 行（tile_c 个）
     if (threadIdx.y == 0) {
-        if (c < col_end) {
+        if (c < col_end) 
             sU[threadIdx.x] = A[row_k + (size_t)c * lda];
-        } else {
+        else             
             sU[threadIdx.x] = __float2half(0.0f);
-        }
     }
     __syncthreads();
 
     if (r >= m || c >= col_end) return;
 
-    // L 每个线程自己读一次（避免缓存 L 带来的额外开销）
-    const half L = A[r + (size_t)col_k * lda];
-    const half U = sU[threadIdx.x];
-
+    const half L   = A[r + (size_t)col_k * lda];
+    const half U   = sU[threadIdx.x];
     const half A_h = A[r + (size_t)c * lda];
     A[r + (size_t)c * lda] = __hsub(A_h, __hmul(L, U));
 }
 
-// ----------------------------------------------------------------------------
-// 主启动函数：纯 cooperative（无 fallback）
-// ----------------------------------------------------------------------------
-inline void launch_panel_TSLU(
-    half* A,
-    int   m,
-    int   lda,
-    int   j0,
-    int   ib,
-    int   uc,
-    int*  d_ipiv_rel,
-    cudaStream_t stream)
+/**
+ * ============================================================================
+ * 对外接口1：计算 cooperative pivot 能用的最大 grid，以及推荐 num_blocks_pivot
+ * ============================================================================
+ *
+ * 说明：
+ * - 这个函数会查询设备属性与 occupancy（依赖 kernel 的寄存器/shared 使用）。
+ * - 返回值 num_blocks_pivot 是你在 launch_panel_TSLU 中应使用的 blocks 数。
+ * - 外部通常只需对“最坏情况 j0=0”调用一次，得到最大 workspace 并复用。
+ */
+inline int panel_TSLU_required_pivot_blocks(int m, int j0)
 {
-    (void)uc;
-
-    if (!A || !d_ipiv_rel) {
-        fprintf(stderr, "launch_panel_TSLU: null pointer input.\n");
-        std::exit(EXIT_FAILURE);
-    }
-    if (ib <= 0) return;
-    if (j0 < 0 || j0 >= m) return;
-
     const int m_effective = m - j0;
-    if (m_effective <= 0) return;
+    if (m_effective <= 0) return 1;
 
-    const int threads_pivot = 256;
-    const size_t shmem_coop = sizeof(half) * (size_t)threads_pivot + sizeof(int) * (size_t)threads_pivot;
-
-    // cooperative 支持性检查
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
 
     int coop_supported = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&coop_supported, cudaDevAttrCooperativeLaunch, dev));
     if (!coop_supported) {
-        fprintf(stderr, "Error: cooperative launch not supported on this device.\n");
+        fprintf(stderr, "panel_TSLU_required_pivot_blocks: cooperative launch not supported.\n");
         std::exit(EXIT_FAILURE);
     }
 
-    // max cooperative grid
+    const int threads_pivot = 256;
+    const size_t shmem_coop = (size_t)threads_pivot * (sizeof(half) + sizeof(int));
+
     int sm_count = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev));
 
@@ -344,54 +301,124 @@ inline void launch_panel_TSLU(
     int max_coop_grid = sm_count * max_blocks_per_sm;
     if (max_coop_grid < 1) max_coop_grid = 1;
 
-    // num_blocks_pivot（通过 rows_per_block 调整）
     int rows_per_block;
     if (m_effective >= 24576)      rows_per_block = 1024;
     else if (m_effective >= 12288) rows_per_block = 512;
     else if (m_effective >= 4096)  rows_per_block = 256;
     else                           rows_per_block = 128;
 
-    int num_blocks_pivot = (m_effective + rows_per_block - 1) / rows_per_block;
-    if (num_blocks_pivot < 1) num_blocks_pivot = 1;
-    if (num_blocks_pivot > 64) num_blocks_pivot = 64;
+    int num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
+    if (num_blocks < 1) num_blocks = 1;
+    if (num_blocks > 64) num_blocks = 64;
 
-    if (num_blocks_pivot > max_coop_grid) {
+    if (num_blocks > max_coop_grid) {
         int min_rows_per_block = (m_effective + max_coop_grid - 1) / max_coop_grid;
         if (min_rows_per_block < 1) min_rows_per_block = 1;
         rows_per_block = min_rows_per_block;
-        num_blocks_pivot = (m_effective + rows_per_block - 1) / rows_per_block;
-        if (num_blocks_pivot < 1) num_blocks_pivot = 1;
+        num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
+        if (num_blocks < 1) num_blocks = 1;
     }
 
-    if (num_blocks_pivot > max_coop_grid) {
+    if (num_blocks > max_coop_grid) {
         fprintf(stderr,
-                "Error: cooperative grid too large. num_blocks=%d, max_coop_grid=%d\n",
-                num_blocks_pivot, max_coop_grid);
+                "panel_TSLU_required_pivot_blocks: cooperative grid too large. need=%d max=%d\n",
+                num_blocks, max_coop_grid);
         std::exit(EXIT_FAILURE);
     }
 
-    // workspace
-    panel_ws::ensure_capacity(num_blocks_pivot);
-    half* d_block_val = panel_ws::g_block_val;
-    int*  d_block_idx = panel_ws::g_block_idx;
+    return num_blocks;
+}
 
-    // swap kernel config
-    dim3 grid_row_swap((ib + 255) / 256);
-    dim3 block_row_swap(256);
+/**
+ * 对外接口2：给定 num_blocks_pivot，计算 workspace bytes
+ * 你也可以直接用：bytes = blocks*(sizeof(half)+sizeof(int))
+ */
+inline size_t panel_TSLU_workspace_bytes_from_blocks(int num_blocks_pivot)
+{
+    return (size_t)num_blocks_pivot * (sizeof(half) + sizeof(int));
+}
 
-    // update kernel config（维持你原来的 tile）
-    const int tile_c = 4;
-    const int tile_r = 32;
-    dim3 block_upd(tile_c, tile_r);
+/**
+ * ============================================================================
+ * 主启动函数（保留原名字，但改为外部传入 workspace）
+ * ============================================================================
+ *
+ * 你需要外部提前分配：
+ *   - half* d_block_val   (至少 num_blocks_pivot 个元素)
+ *   - int*  d_block_idx   (至少 num_blocks_pivot 个元素)
+ *
+ * 传入：
+ *   - num_blocks_pivot：建议使用 panel_TSLU_required_pivot_blocks(m, j0) 的返回值
+ *
+ * 注意：本函数不再 malloc/free。
+ */
+inline void launch_panel_TSLU(
+    half* A,
+    int   m,
+    int   lda,
+    int   j0,
+    int   ib,
+    int   uc,
+    int*  d_ipiv_rel,
+    cudaStream_t stream,
+    half* d_block_val,
+    int*  d_block_idx,
+    int   num_blocks_pivot)  // 要在函数体外规定好 pivot 会使用多少 block
+{
+    // 暂时还不会使用 uc，后续可以加上这个参数，对应更新时候的参数设置
+    (void)uc; 
 
-    // update shared: tile_c half
-    const size_t shmem_upd = sizeof(half) * (size_t)tile_c;
+    if (!A || !d_ipiv_rel || !d_block_val || !d_block_idx) {
+        fprintf(stderr, "launch_panel_TSLU: null pointer input.\n");
+        std::exit(EXIT_FAILURE);
+    }
+    if (ib <= 0) 
+        return;
+    if (j0 < 0 || j0 >= m) 
+        return;
+
+    // 需要更新的行数
+    const int m_effective = m - j0;
+    if (m_effective <= 0) 
+        return;
+
+    // 检查 GPU 是否支持协作组
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    int coop_supported = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&coop_supported, cudaDevAttrCooperativeLaunch, dev));
+    if (!coop_supported) {
+        fprintf(stderr, "launch_panel_TSLU: cooperative launch not supported.\n");
+        std::exit(EXIT_FAILURE);
+    }
+
+    // 目前规定好 pivot 的 block 数在 1-64 之间 [fix]
+    if (num_blocks_pivot < 1)  
+        num_blocks_pivot = 1;
+    if (num_blocks_pivot > 64) 
+        num_blocks_pivot = 64;
+
+    // pivot 每 block 的线程数 [fix]
+    const int threads_pivot = 256;
+    const size_t shmem_coop = (size_t)threads_pivot * (sizeof(half) + sizeof(int));
+
+    // swap 的 grid 与 block 配置，核内写的是每个线程处理一列的交换，这里应当和外面我们规定好的相适配，实际上可以剩 block 数 [fix]
+    dim3 grid_row_swap((ib + 127) / 128);
+    dim3 block_row_swap(128);
+
+    // update 的 block 配置，也是需要看一下的地方 [fix]
+    const int tile_col = 4;
+    const int tile_row = 32;
+    dim3 block_upd(tile_col, tile_row);
+    const size_t shmem_upd = sizeof(half) * (size_t)tile_col; // cache U only
 
     for (int k = 0; k < ib; ++k) {
-        int col = j0 + k;
-        if (col >= m) break;
+        // 当前处理的列号
+        const int col = j0 + k;
+        if (col >= m) 
+            break;
 
-        // (1) cooperative pivot + pre-swap scale
+        // pivot 与高斯消元
         void* args[] = {
             (void*)&A,
             (void*)&m, (void*)&lda,
@@ -409,16 +436,16 @@ inline void launch_panel_TSLU(
             shmem_coop,
             stream));
 
-        // (2) swap（panel 内）
+        // 交换 pivot 行
         panel_row_swap_kernel<<<grid_row_swap, block_row_swap, 0, stream>>>(
             A, m, lda, j0, ib, k, d_ipiv_rel);
 
-        // (3) update（缓存 U 行）
-        int rows_rem = m - (j0 + k + 1);
-        int cols_rem = ib - (k + 1);
+        // (3) update
+        const int rows_rem = m - (j0 + k + 1);
+        const int cols_rem = ib - (k + 1);
         if (rows_rem > 0 && cols_rem > 0) {
-            int grid_x = (cols_rem + tile_c - 1) / tile_c;
-            int grid_y = (rows_rem + tile_r - 1) / tile_r;
+            const int grid_x = (cols_rem + tile_col - 1) / tile_col;
+            const int grid_y = (rows_rem + tile_row - 1) / tile_row;
             panel_update_kernel_cacheU<<<dim3(grid_x, grid_y), block_upd, shmem_upd, stream>>>(
                 A, m, lda, j0, ib, k);
         }
@@ -426,14 +453,4 @@ inline void launch_panel_TSLU(
 
     CUDA_CHECK(cudaGetLastError());
 }
-
-// ----------------------------------------------------------------------------
-// 释放 workspace
-// ----------------------------------------------------------------------------
-inline void cleanup_panel_buffers() {
-    if (panel_ws::g_block_val) CUDA_CHECK(cudaFree(panel_ws::g_block_val));
-    if (panel_ws::g_block_idx) CUDA_CHECK(cudaFree(panel_ws::g_block_idx));
-    panel_ws::g_block_val = nullptr;
-    panel_ws::g_block_idx = nullptr;
-    panel_ws::g_capacity  = 0;
-}
+inline void cleanup_panel_buffers() {}

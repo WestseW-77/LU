@@ -1,1 +1,2 @@
 nvcc -o test_LU.out test_LU.cu -arch=sm_89 -lcublas -O3 -std=c++17 --expt-relaxed-constexpr
+./test_LU.out -m 32768 -n 32768 -iters 10
