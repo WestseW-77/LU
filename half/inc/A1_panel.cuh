@@ -226,38 +226,25 @@ __global__ void panel_update_kernel_cacheU(
 {
     const int col_k = j0 + k;
     const int row_k = j0 + k;
-    // 更新的列的起始与结束位置
     const int col_start = col_k + 1;
-    const int col_end   = j0 + ib;
+    const int col_end = j0 + ib;
+    
     if (col_k >= m) 
         return;
-
-    // 因为这里目前选用的二维的，所以要根据形状来进行处理
-    const int tile_col = (int)blockDim.x;
-    const int tile_row = (int)blockDim.y;
-
-    const int c0 = col_start + blockIdx.x * tile_col;
-    const int r  = row_k + 1 + blockIdx.y * tile_row + threadIdx.y;
-    const int c  = c0 + threadIdx.x;
-
-    extern __shared__ unsigned char smem[];
-    // 这里读入了每个 tile 内的行的四个值，用于加速访问
-    half* sU = reinterpret_cast<half*>(smem);
-
-    if (threadIdx.y == 0) {
-        if (c < col_end) 
-            sU[threadIdx.x] = A[row_k + (size_t)c * lda];
-        else             
-            sU[threadIdx.x] = __float2half(0.0f);
-    }
-    __syncthreads();
-
-    if (r >= m || c >= col_end) return;
-
-    const half L   = A[r + (size_t)col_k * lda];
-    const half U   = sU[threadIdx.x];
-    const half A_h = A[r + (size_t)c * lda];
-    A[r + (size_t)c * lda] = __hsub(A_h, __hmul(L, U));
+    
+    // 简化：每个 block 处理 1 列
+    const int c = col_start + blockIdx.x;
+    const int r = row_k + 1 + blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (c >= col_end || r >= m) 
+        return;
+    
+    // 直接从全局内存读取（L1 cache 会处理 U 的重复读取）
+    const half L = A[r + (size_t)col_k * lda];      // coalesced 读取
+    const half U = A[row_k + (size_t)c * lda];      // 所有线程读同一个值，会被 broadcast
+    const half A_val = A[r + (size_t)c * lda];      // coalesced 读取
+    
+    A[r + (size_t)c * lda] = __hsub(A_val, __hmul(L, U));  // coalesced 写入
 }
 
 /**
@@ -302,14 +289,20 @@ inline int panel_TSLU_required_pivot_blocks(int m, int j0)
     if (max_coop_grid < 1) max_coop_grid = 1;
 
     int rows_per_block;
-    if (m_effective >= 24576)      rows_per_block = 1024;
-    else if (m_effective >= 12288) rows_per_block = 512;
-    else if (m_effective >= 4096)  rows_per_block = 256;
-    else                           rows_per_block = 128;
+    if (m_effective >= 24576)      
+        rows_per_block = 1024;
+    else if (m_effective >= 12288) 
+        rows_per_block = 512;
+    else if (m_effective >= 4096)  
+        rows_per_block = 256;
+    else                           
+        rows_per_block = 128;
 
     int num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
-    if (num_blocks < 1) num_blocks = 1;
-    if (num_blocks > 64) num_blocks = 64;
+    if (num_blocks < 1) 
+        num_blocks = 1;
+    if (num_blocks > 64) 
+        num_blocks = 64;
 
     if (num_blocks > max_coop_grid) {
         int min_rows_per_block = (m_effective + max_coop_grid - 1) / max_coop_grid;
@@ -406,11 +399,11 @@ inline void launch_panel_TSLU(
     dim3 grid_row_swap((ib + 127) / 128);
     dim3 block_row_swap(128);
 
-    // update 的 block 配置，也是需要看一下的地方 [fix]
-    const int tile_col = 4;
-    const int tile_row = 32;
-    dim3 block_upd(tile_col, tile_row);
-    const size_t shmem_upd = sizeof(half) * (size_t)tile_col; // cache U only
+    // update 的 block 配置，也是需要看一下的地方，目前来看会对性能有较大的影响，我认为可以考虑这里根据 size 采用动态分配 [fix]
+    const int tile_col = 1;
+    const int tile_row = 256;
+    dim3 block_upd(tile_row);
+    const size_t shmem_upd = 0;
 
     for (int k = 0; k < ib; ++k) {
         // 当前处理的列号
@@ -440,10 +433,13 @@ inline void launch_panel_TSLU(
         panel_row_swap_kernel<<<grid_row_swap, block_row_swap, 0, stream>>>(
             A, m, lda, j0, ib, k, d_ipiv_rel);
 
-        // (3) update
+        // 更新尾矩阵
+
+        // 需要更新的行数与列数
         const int rows_rem = m - (j0 + k + 1);
         const int cols_rem = ib - (k + 1);
         if (rows_rem > 0 && cols_rem > 0) {
+            // 每个线程负责一个数据，看总共需要起多少个 block
             const int grid_x = (cols_rem + tile_col - 1) / tile_col;
             const int grid_y = (rows_rem + tile_row - 1) / tile_row;
             panel_update_kernel_cacheU<<<dim3(grid_x, grid_y), block_upd, shmem_upd, stream>>>(
