@@ -10,7 +10,9 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 
+// 新的 cuSOLVER-like API
 #include "hgetrf.cuh"
+
 #include "A1_panel.cuh"
 #include "A12_TRSM.cuh"
 #include "A22_GEMM.cuh"
@@ -113,11 +115,11 @@ __global__ void build_PA_half_kernel(const half* __restrict__ A0,
 {
     int j = blockIdx.x;
     int i = blockIdx.y * blockDim.x + threadIdx.x;
-    if (j >= n || i >= m) 
+    if (j >= n || i >= m)
         return;
 
     int src = piv_rows[i];
-    if (src < 0 || src >= m) 
+    if (src < 0 || src >= m)
         return;
 
     half v = A0[src + (size_t)j * lda];
@@ -170,32 +172,48 @@ TestResult test_matrix_lu(
     int m, int n, int lda,
     int uc,
     int iters, int warmup,
-    cublasHandle_t handle,
+    cublasHandle_t cublas,
     bool verbose)
 {
     TestResult result{};
-    
+
     half* dA_half  = nullptr;
     half* dA0_half = nullptr;
-    int* d_ipiv_rel = nullptr;
+    int*  d_ipiv_rel = nullptr;
 
     CUDA_CHECK(cudaMalloc(&dA_half,  sizeof(half) * (size_t)lda * n));
     CUDA_CHECK(cudaMalloc(&dA0_half, sizeof(half) * (size_t)lda * n));
-    CUDA_CHECK(cudaMalloc(&d_ipiv_rel, sizeof(int) * std::max(m, n)));
+    CUDA_CHECK(cudaMalloc(&d_ipiv_rel, sizeof(int) * (size_t)std::max(m, n)));
 
     CUDA_CHECK(cudaMemcpy(dA0_half, hA0_half.data(),
                           sizeof(half) * (size_t)lda * n,
                           cudaMemcpyHostToDevice));
 
-    std::vector<int> h_ipiv_rel(std::max(m, n));
-    std::vector<int> piv_rows(m);
+    // ===== cuSOLVER-like handle + workspace =====
+    hgetrfHandle_t h = nullptr;
+    hgetrfCreate(&h);
+    hgetrfSetStream(h, 0);
+    hgetrfSetCublas(h, cublas);
+
+    const int panel_width = 128;
+
+    size_t lwork = 0;
+    hgetrf_bufferSize(h, m, n, lda, panel_width, &lwork);
+
+    void* d_work = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_work, lwork));
+
+    int* d_piv_rows = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_piv_rows, sizeof(int) * (size_t)m));
 
     printf("\n========================================\n");
-    printf("Half 精度 LU 分解测试\n");
+    printf("Half 精度 LU 分解测试 (workspace 外置, cuSOLVER-like)\n");
     printf("========================================\n");
     printf("矩阵规模: %d × %d\n", m, n);
+    printf("panel宽度: %d\n", panel_width);
     printf("微块大小: %d\n", uc);
     printf("迭代次数: %d (warmup: %d)\n", iters, warmup);
+    printf("workspace: %zu bytes\n", lwork);
     printf("========================================\n");
 
     // Warmup
@@ -205,21 +223,20 @@ TestResult test_matrix_lu(
             CUDA_CHECK(cudaMemcpy(dA_half, dA0_half,
                                   sizeof(half) * (size_t)lda * n,
                                   cudaMemcpyDeviceToDevice));
-            
-            HgetrfConfig config;
-            config.use_tensor_core_gemm = true;
-            config.trsm_mode = HgetrfConfig::TRSM_CUSTOM_KERNEL;
-            config.verbose = false;
-            
-            hgetrf_auto(dA_half, m, n, lda, 128, uc, handle,
-                       d_ipiv_rel, h_ipiv_rel.data(), piv_rows.data(),
-                       config, 0, nullptr);
+
+            int info = 0;
+            hgetrf(h, m, n, dA_half, lda,
+                  panel_width, uc,
+                  d_ipiv_rel,
+                  d_piv_rows,
+                  d_work, lwork,
+                  &info);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("[Warmup] Complete!\n");
     }
 
-    // Performance test (不使用timer)
+    // Performance test
     cudaEvent_t ev_start, ev_stop;
     CUDA_CHECK(cudaEventCreate(&ev_start));
     CUDA_CHECK(cudaEventCreate(&ev_stop));
@@ -230,15 +247,14 @@ TestResult test_matrix_lu(
         CUDA_CHECK(cudaMemcpy(dA_half, dA0_half,
                               sizeof(half) * (size_t)lda * n,
                               cudaMemcpyDeviceToDevice));
-        
-        HgetrfConfig config;
-        config.use_tensor_core_gemm = true;
-        config.trsm_mode = HgetrfConfig::TRSM_CUSTOM_KERNEL;
-        config.verbose = false;
-        
-        hgetrf_auto(dA_half, m, n, lda, 128, uc, handle,
-                   d_ipiv_rel, h_ipiv_rel.data(), piv_rows.data(),
-                   config, 0, nullptr);
+
+        int info = 0;
+        hgetrf(h, m, n, dA_half, lda,
+              panel_width, uc,
+              d_ipiv_rel,
+              d_piv_rows,
+              d_work, lwork,
+              &info);
     }
     CUDA_CHECK(cudaEventRecord(ev_stop));
     CUDA_CHECK(cudaEventSynchronize(ev_stop));
@@ -255,44 +271,11 @@ TestResult test_matrix_lu(
     printf("  平均时间: %.4f ms\n", result.avg_time_ms);
     printf("  性能:     %.2f GFLOP/s\n", result.gflops);
 
-    // 单独运行一次带timer的版本来分析性能
-    printf("\n[Profiling] 分析性能瓶颈...\n");
-    CUDA_CHECK(cudaMemcpy(dA_half, dA0_half,
-                          sizeof(half) * (size_t)lda * n,
-                          cudaMemcpyDeviceToDevice));
-    
-    HgetrfConfig prof_config;
-    prof_config.use_tensor_core_gemm = true;
-    prof_config.trsm_mode = HgetrfConfig::TRSM_CUSTOM_KERNEL;
-    prof_config.verbose = verbose;
-    
-    HgetrfTimers timers;
-    hgetrf_auto(dA_half, m, n, lda, 128, uc, handle,
-               d_ipiv_rel, h_ipiv_rel.data(), piv_rows.data(),
-               prof_config, 0, &timers);
-    
-    printf("[Profiling] Complete!\n");
-    printf("\n性能分解:\n");
-    printf("  Panel数量: %d\n", timers.panels);
-    double total = timers.panel_ms + timers.exchange_ms + timers.trsm_ms + timers.gemm_ms;
-    printf("  Panel:     %.2f ms (%.1f%%)\n", timers.panel_ms, 100.0 * timers.panel_ms / total);
-    printf("  Exchange:  %.2f ms (%.1f%%)\n", timers.exchange_ms, 100.0 * timers.exchange_ms / total);
-    printf("  TRSM:      %.2f ms (%.1f%%)\n", timers.trsm_ms, 100.0 * timers.trsm_ms / total);
-    printf("  GEMM:      %.2f ms (%.1f%%)\n", timers.gemm_ms, 100.0 * timers.gemm_ms / total);
-    printf("  Total:     %.2f ms\n", timers.total_ms);
-    printf("\n瓶颈分析:\n");
-    double max_time = std::max({timers.panel_ms, timers.exchange_ms, timers.trsm_ms, timers.gemm_ms});
-    if (max_time == timers.gemm_ms) {
-        printf("  主要瓶颈: GEMM (矩阵乘法)\n");
-    } else if (max_time == timers.panel_ms) {
-        printf("  主要瓶颈: Panel分解\n");
-    } else if (max_time == timers.trsm_ms) {
-        printf("  主要瓶颈: TRSM (三角求解)\n");
-    } else {
-        printf("  主要瓶颈: Exchange (行交换)\n");
-    }
+    // Profiling（这里保留 verbose 输出，但我们这个版本不做内部 timers）
+    printf("\n[Profiling] (本版本不在 hgetrf 内部做分段 timers；建议用 Nsight)\n");
+    (void)verbose;
 
-    // Accuracy test - 使用性能测试最后一次迭代的结果
+    // Accuracy test - 使用性能测试最后一次迭代的 dA_half & d_piv_rows
     printf("\n[Accuracy] 验证分解正确性...\n");
 
     half* dL_half  = nullptr;
@@ -300,18 +283,12 @@ TestResult test_matrix_lu(
     half* dPA_half = nullptr;
     half* dLU_half = nullptr;
     half* dR_half  = nullptr;
-    int*  d_piv_rows = nullptr;
 
     CUDA_CHECK(cudaMalloc(&dL_half,  sizeof(half) * (size_t)lda * n));
     CUDA_CHECK(cudaMalloc(&dU_half,  sizeof(half) * (size_t)lda * n));
     CUDA_CHECK(cudaMalloc(&dPA_half, sizeof(half) * (size_t)lda * n));
     CUDA_CHECK(cudaMalloc(&dLU_half, sizeof(half) * (size_t)lda * n));
     CUDA_CHECK(cudaMalloc(&dR_half,  sizeof(half) * (size_t)lda * n));
-    CUDA_CHECK(cudaMalloc(&d_piv_rows, sizeof(int) * m));
-
-    CUDA_CHECK(cudaMemcpy(d_piv_rows, piv_rows.data(),
-                          sizeof(int) * m,
-                          cudaMemcpyHostToDevice));
 
     // 构建L和U
     {
@@ -321,7 +298,7 @@ TestResult test_matrix_lu(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // 构建PA
+    // 构建PA：直接用 device piv_rows
     {
         dim3 block(128);
         dim3 grid(n, (m + block.x - 1) / block.x);
@@ -334,7 +311,7 @@ TestResult test_matrix_lu(
         float alpha = 1.0f;
         float beta  = 0.0f;
         CUBLAS_CHECK(
-            cublasGemmEx(handle,
+            cublasGemmEx(cublas,
                          CUBLAS_OP_N, CUBLAS_OP_N,
                          m, n, n,
                          &alpha,
@@ -375,7 +352,7 @@ TestResult test_matrix_lu(
     printf("  ||A||_F            = %.6f\n", result.normA);
     printf("  ||PA - L*U||_F     = %.6f\n", result.normRes);
     printf("  相对误差           = %.6e\n", result.relErr);
-    
+
     if (result.relErr < 1e-3) {
         printf("  ✓ 精度优秀 (< 1e-3)\n");
     } else if (result.relErr < 1e-2) {
@@ -389,15 +366,21 @@ TestResult test_matrix_lu(
     // Cleanup
     CUDA_CHECK(cudaEventDestroy(ev_start));
     CUDA_CHECK(cudaEventDestroy(ev_stop));
-    CUDA_CHECK(cudaFree(dA_half));
-    CUDA_CHECK(cudaFree(dA0_half));
-    CUDA_CHECK(cudaFree(d_ipiv_rel));
+
     CUDA_CHECK(cudaFree(dL_half));
     CUDA_CHECK(cudaFree(dU_half));
     CUDA_CHECK(cudaFree(dPA_half));
     CUDA_CHECK(cudaFree(dLU_half));
     CUDA_CHECK(cudaFree(dR_half));
+
+    CUDA_CHECK(cudaFree(dA_half));
+    CUDA_CHECK(cudaFree(dA0_half));
+    CUDA_CHECK(cudaFree(d_ipiv_rel));
+
+    CUDA_CHECK(cudaFree(d_work));
     CUDA_CHECK(cudaFree(d_piv_rows));
+
+    hgetrfDestroy(h);
 
     return result;
 }
@@ -420,10 +403,10 @@ void print_usage(const char* prog) {
 
 TestConfig parse_args(int argc, char** argv) {
     TestConfig config;
-    
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        
+
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             std::exit(0);
@@ -447,7 +430,7 @@ TestConfig parse_args(int argc, char** argv) {
             config.verbose = true;
         }
     }
-    
+
     return config;
 }
 
@@ -478,6 +461,7 @@ int main(int argc, char** argv)
         cfg.iters, cfg.warmup,
         handle, cfg.verbose);
 
+    // 你原来的清理保留
     cleanup_panel_buffers();
     cleanup_exchange_buffers();
     CUBLAS_CHECK(cublasDestroy(handle));
