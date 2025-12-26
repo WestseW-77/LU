@@ -17,7 +17,7 @@
 #endif
 
 using half = __half;
-
+// 单次交换，但是理论上一交换就是一大堆一起交换
 __global__ void swap_rows_kernel(
     half* __restrict__ A,
     int m, int n, int lda,

@@ -217,87 +217,8 @@ __global__ void panel_row_swap_kernel_vec(
     }
 }
 
-// ============================================================================
-// ✨ 优化2：Update Kernel - half2 + ILP×2（每线程处理 4 行）
-// ============================================================================
 
-__global__ void panel_update_kernel_vec_ILP2(
-    half* __restrict__ A,
-    int m, int lda,
-    int j0, int ib,
-    int k)
-{
-    const int col_k = j0 + k;
-    const int row_k = j0 + k;
-    const int col_start = col_k + 1;
-    const int col_end = j0 + ib;
-    
-    if (col_k >= m) 
-        return;
-    
-    const int c = col_start + blockIdx.x;
-    if (c >= col_end) 
-        return;
-    
-    // ✨ 每个线程处理 4 行（2 个 half2）
-    const int r_base = row_k + 1 + blockIdx.y * 1024;
-    const int r0 = r_base + threadIdx.x * 2;        // 第一对
-    const int r1 = r_base + threadIdx.x * 2 + 512;  // 第二对
-    
-    // 读取 U 一次，broadcast
-    const half U_scalar = __ldg(&A[row_k + (size_t)c * lda]);
-    const half2 U = __half2half2(U_scalar);
-    
-    // ========================================
-    // 处理第一对（r0, r0+1）
-    // ========================================
-    if (r0 + 1 < m) {
-        half2 L, Av;
-        L.x = __ldg(&A[r0 + 0 + (size_t)col_k * lda]);
-        L.y = __ldg(&A[r0 + 1 + (size_t)col_k * lda]);
-        
-        Av.x = A[r0 + 0 + (size_t)c * lda];
-        Av.y = A[r0 + 1 + (size_t)c * lda];
-        
-        half2 result = __hsub2(Av, __hmul2(L, U));
-        
-        A[r0 + 0 + (size_t)c * lda] = result.x;
-        A[r0 + 1 + (size_t)c * lda] = result.y;
-        
-    } else if (r0 < m) {
-        // 只有 1 行
-        const half L = __ldg(&A[r0 + (size_t)col_k * lda]);
-        const half Av = A[r0 + (size_t)c * lda];
-        A[r0 + (size_t)c * lda] = __hsub(Av, __hmul(L, U_scalar));
-    }
-    
-    // ========================================
-    // 处理第二对（r1, r1+1）
-    // ========================================
-    if (r1 + 1 < m) {
-        half2 L, Av;
-        L.x = __ldg(&A[r1 + 0 + (size_t)col_k * lda]);
-        L.y = __ldg(&A[r1 + 1 + (size_t)col_k * lda]);
-        
-        Av.x = A[r1 + 0 + (size_t)c * lda];
-        Av.y = A[r1 + 1 + (size_t)c * lda];
-        
-        half2 result = __hsub2(Av, __hmul2(L, U));
-        
-        A[r1 + 0 + (size_t)c * lda] = result.x;
-        A[r1 + 1 + (size_t)c * lda] = result.y;
-        
-    } else if (r1 < m) {
-        const half L = __ldg(&A[r1 + (size_t)col_k * lda]);
-        const half Av = A[r1 + (size_t)c * lda];
-        A[r1 + (size_t)c * lda] = __hsub(Av, __hmul(L, U_scalar));
-    }
-}
-
-// ============================================================================
-// ✨ 优化3：Update Kernel - 纯 half2（简化版）
-// ============================================================================
-
+// 更新后续矩阵
 __global__ void panel_update_kernel_vec(
     half* __restrict__ A,
     int m, int lda,
@@ -306,16 +227,17 @@ __global__ void panel_update_kernel_vec(
 {
     const int col_k = j0 + k;
     const int row_k = j0 + k;
+    // 更新的起始列和结束列
     const int col_start = col_k + 1;
     const int col_end = j0 + ib;
     
     if (col_k >= m) 
         return;
-    
+    // 设计中，blockIdx.x 表示该 block 更新的列块号
     const int c = col_start + blockIdx.x;
     if (c >= col_end) 
         return;
-    
+    // 目前设计上每个 block 都解决了一列上面 512 行的更新，而blockIdx.y 表示该 block 更新的行块号
     const int r_base = row_k + 1 + blockIdx.y * 512;
     const int r = r_base + threadIdx.x * 2;
     
@@ -330,7 +252,7 @@ __global__ void panel_update_kernel_vec(
         return;
     }
     
-    // ✨ 向量化处理
+    // 变向量便于合并计算
     const half U_scalar = __ldg(&A[row_k + (size_t)c * lda]);
     const half2 U = __half2half2(U_scalar);
     
@@ -348,18 +270,20 @@ __global__ void panel_update_kernel_vec(
     A[r + 1 + (size_t)c * lda] = result.y;
 }
 
-// ============================================================================
-// 辅助函数
-// ============================================================================
 
+// 为 pivot 选择一个合理大小的 block 数量，这边是可以调参的 [fix]
 inline int panel_TSLU_required_pivot_blocks(int m, int j0)
 {
+    // 本轮要处理的实际行数
     const int m_effective = m - j0;
-    if (m_effective <= 0) return 1;
+    if (m_effective <= 0) 
+        return 1;
 
+    // 获取设备
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
 
+    // 检查是否支持协作组
     int coop_supported = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&coop_supported, cudaDevAttrCooperativeLaunch, dev));
     if (!coop_supported) {
@@ -367,9 +291,11 @@ inline int panel_TSLU_required_pivot_blocks(int m, int j0)
         std::exit(EXIT_FAILURE);
     }
 
+    // 限定了每个 block 的线程数
     const int threads_pivot = 256;
     const size_t shmem_coop = (size_t)threads_pivot * (sizeof(half) + sizeof(int));
 
+    // 查询当前硬件的 sm 数量
     int sm_count = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev));
 
@@ -380,25 +306,35 @@ inline int panel_TSLU_required_pivot_blocks(int m, int j0)
         threads_pivot,
         (int)shmem_coop));
 
+    // 计算最大 block 数量
     int max_coop_grid = sm_count * max_blocks_per_sm;
-    if (max_coop_grid < 1) max_coop_grid = 1;
+    if (max_coop_grid < 1) 
+        max_coop_grid = 1;
 
     int rows_per_block;
-    if (m_effective >= 24576)      rows_per_block = 1024;
-    else if (m_effective >= 12288) rows_per_block = 512;
-    else if (m_effective >= 4096)  rows_per_block = 256;
-    else                           rows_per_block = 128;
+    if (m_effective >= 24576)      
+        rows_per_block = 1024;
+    else if (m_effective >= 12288) 
+        rows_per_block = 512;
+    else if (m_effective >= 4096)  
+        rows_per_block = 256;
+    else                           
+        rows_per_block = 128;
 
     int num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
-    if (num_blocks < 1) num_blocks = 1;
-    if (num_blocks > 64) num_blocks = 64;
+    if (num_blocks < 1) 
+        num_blocks = 1;
+    if (num_blocks > 64) 
+        num_blocks = 64;
 
     if (num_blocks > max_coop_grid) {
         int min_rows_per_block = (m_effective + max_coop_grid - 1) / max_coop_grid;
-        if (min_rows_per_block < 1) min_rows_per_block = 1;
+        if (min_rows_per_block < 1) 
+            min_rows_per_block = 1;
         rows_per_block = min_rows_per_block;
         num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
-        if (num_blocks < 1) num_blocks = 1;
+        if (num_blocks < 1) 
+            num_blocks = 1;
     }
 
     if (num_blocks > max_coop_grid) {
@@ -416,15 +352,7 @@ inline size_t panel_TSLU_workspace_bytes_from_blocks(int num_blocks_pivot)
     return (size_t)num_blocks_pivot * (sizeof(half) + sizeof(int));
 }
 
-// ============================================================================
-// ✨ 主启动函数（简化版，只保留最优配置）
-// ============================================================================
-
-/**
- * use_aggressive: 
- *   false = 纯 half2（推荐，稳定）
- *   true  = half2 + ILP×2（更激进，可能更快）
- */
+// 对外接口
 inline void launch_panel_TSLU(
     half* A,
     int   m,
@@ -436,8 +364,7 @@ inline void launch_panel_TSLU(
     cudaStream_t stream,
     half* d_block_val,
     int*  d_block_idx,
-    int   num_blocks_pivot,
-    bool  use_aggressive = false)
+    int   num_blocks_pivot)
 {
     (void)uc;
 
@@ -450,10 +377,12 @@ inline void launch_panel_TSLU(
     if (j0 < 0 || j0 >= m) 
         return;
 
+    // 本轮需要处理的 panel 的行数
     const int m_effective = m - j0;
     if (m_effective <= 0) 
         return;
 
+    // 检验是否支持协作组
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     int coop_supported = 0;
@@ -471,23 +400,20 @@ inline void launch_panel_TSLU(
     const int threads_pivot = 256;
     const size_t shmem_coop = (size_t)threads_pivot * (sizeof(half) + sizeof(int));
 
-    // ✨ Swap 配置（向量化：每线程处理 2 列）
+    // swap 的线程配置
     dim3 grid_row_swap((ib + 255) / 256);  // 128 threads × 2 cols = 256 cols/block
     dim3 block_row_swap(128);
 
-    // Update 配置
+    // Update 的线程配置
     dim3 block_upd(256);
-    const int rows_per_block = use_aggressive ? 1024 : 512;
+    const int rows_per_block = 512;
 
-    // ========================================
-    // 主循环
-    // ========================================
     for (int k = 0; k < ib; ++k) {
         const int col = j0 + k;
         if (col >= m) 
             break;
 
-        // (1) Pivot + Scale
+        // 选主元并高斯消元
         void* args[] = {
             (void*)&A, (void*)&m, (void*)&lda,
             (void*)&j0, (void*)&k,
@@ -500,11 +426,11 @@ inline void launch_panel_TSLU(
             dim3(num_blocks_pivot), dim3(threads_pivot),
             args, shmem_coop, stream));
 
-        // (2) ✨ Vectorized Row Swap
+        // 行交换
         panel_row_swap_kernel_vec<<<grid_row_swap, block_row_swap, 0, stream>>>(
             A, m, lda, j0, ib, k, d_ipiv_rel);
 
-        // (3) ✨ Vectorized Update
+        // 更新
         const int rows_rem = m - (j0 + k + 1);
         const int cols_rem = ib - (k + 1);
         
@@ -512,13 +438,8 @@ inline void launch_panel_TSLU(
             const int grid_x = cols_rem;
             const int grid_y = (rows_rem + rows_per_block - 1) / rows_per_block;
             
-            if (use_aggressive) {
-                panel_update_kernel_vec_ILP2<<<dim3(grid_x, grid_y), block_upd, 0, stream>>>(
-                    A, m, lda, j0, ib, k);
-            } else {
-                panel_update_kernel_vec<<<dim3(grid_x, grid_y), block_upd, 0, stream>>>(
-                    A, m, lda, j0, ib, k);
-            }
+            panel_update_kernel_vec<<<dim3(grid_x, grid_y), block_upd, 0, stream>>>(
+                A, m, lda, j0, ib, k);
         }
     }
 
