@@ -10,7 +10,6 @@
 #include <vector>
 #include <algorithm>
 
-// 你现有的模块
 #include "A1_panel.cuh"
 #include "A_exchange.cuh"
 #include "A12_TRSM.cuh"
@@ -43,24 +42,23 @@
 
 using half = __half;
 
-// ============================================================================
-// cuSOLVER-like handle (stream/event 仅创建一次，workspace 不在 handle 内分配)
-// ============================================================================
-
+// 句柄，仿 cusolver 的形式
 struct hgetrfHandle {
     cublasHandle_t cublas = nullptr;
+    // 双流设计，一条用于 panel，一条用于 update，并给出两个信号进行同步
     cudaStream_t   stream = 0;
-
-    cudaStream_t stream_panel = nullptr;   // 非阻塞 panel stream
-    cudaEvent_t  ev_piv_ready = nullptr;   // panel 完成 pivot+pivrows 更新
-    cudaEvent_t  ev_next_ready = nullptr;  // next panel 所需列更新完成
+    cudaStream_t stream_panel = nullptr;
+    // panel 完成和 next panel 需求数据完成
+    cudaEvent_t  ev_piv_ready = nullptr;
+    cudaEvent_t  ev_next_ready = nullptr; 
 };
 
 using hgetrfHandle_t = hgetrfHandle*;
 
 inline void hgetrfCreate(hgetrfHandle_t* out)
 {
-    if (!out) return;
+    if (!out) 
+        return;
     hgetrfHandle_t h = new hgetrfHandle;
 
     CUDA_CHECK(cudaStreamCreateWithFlags(&h->stream_panel, cudaStreamNonBlocking));
@@ -78,7 +76,7 @@ inline void hgetrfDestroy(hgetrfHandle_t h)
     if (h->stream_panel)  CUDA_CHECK(cudaStreamDestroy(h->stream_panel));
     delete h;
 }
-
+// 外部控制主 stream 和 cublas handle
 inline void hgetrfSetStream(hgetrfHandle_t h, cudaStream_t s)
 {
     if (!h) return;
@@ -91,15 +89,14 @@ inline void hgetrfSetCublas(hgetrfHandle_t h, cublasHandle_t c)
     h->cublas = c;
 }
 
-// ============================================================================
-// Workspace layout (device workspace 只放纯数据)
-// ============================================================================
 
+// 这里可能是需要修改的，加上其他各个部分所需要的 workspace 数据 [fix]
 struct HgetrfWorkspaceView {
     half* d_panel_block_val = nullptr;
     int*  d_panel_block_idx = nullptr;
+    // 每行经过置换后对应的原始行号
     int*  d_piv_rows        = nullptr;
-
+    // pivot 的最大块数
     int num_blocks_pivot_max = 0;
 };
 
@@ -108,10 +105,7 @@ static inline size_t align_up(size_t x, size_t a) {
     return (x + (a - 1)) & ~(a - 1);
 }
 
-// ============================================================================
-// bufferSize: 模仿 cusolverDnXgetrf_bufferSize
-// 只返回 device workspace bytes
-// ============================================================================
+// 计算需要算多大的 workspace
 inline void hgetrf_bufferSize(
     hgetrfHandle_t /*h*/,
     int m, int /*n*/, int /*lda*/,
@@ -129,6 +123,7 @@ inline void hgetrf_bufferSize(
     bytes = align_up(bytes, 256);
     bytes += sizeof(int)  * (size_t)num_blocks;   // d_panel_block_idx
     bytes = align_up(bytes, 256);
+    // [fix] 感觉这里不需要整个 m 的空间，而是只需要申请本次 TSLU 的行数空间，比如说传入 32768 * 16384 的，则只需要 16384 个
     bytes += sizeof(int)  * (size_t)m;            // d_piv_rows
 
     *device_bytes = bytes;
