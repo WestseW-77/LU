@@ -61,7 +61,7 @@ struct TestConfig {
 // 辅助函数
 // ============================================================================
 
-void generate_random_A_float(std::vector<float>& hA, int m, int n, int lda, unsigned seed = 1234567)
+void generate_random_A_float(std::vector<float>& hA, int m, int n, int lda, unsigned seed = 77777)
 {
     std::mt19937 rng(seed);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -156,6 +156,54 @@ double frob_norm_half_host(const std::vector<half>& H, int m, int n, int lda)
 }
 
 // ============================================================================
+// 从 ipiv (1-based, length k=min(m,n)) 构建 piv_rows（长度 m）
+// piv_rows[r] = 原始哪一行被换到 r
+// 这只用于 accuracy，不进入 hgetrf 热路径
+// ============================================================================
+__global__ void init_piv_rows_kernel(int* piv_rows, int m)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < m) piv_rows[i] = i;
+}
+
+__global__ void build_pivrows_from_ipiv_kernel(
+    int* piv_rows,
+    int m,
+    int k,
+    const int* __restrict__ ipiv) // 1-based
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    for (int i = 0; i < k; ++i) {
+        int r1 = i;
+        int r2 = ipiv[i] - 1; // to 0-based
+
+        if (r1 == r2) continue;
+        if ((unsigned)r1 >= (unsigned)m || (unsigned)r2 >= (unsigned)m) continue;
+
+        int tmp = piv_rows[r1];
+        piv_rows[r1] = piv_rows[r2];
+        piv_rows[r2] = tmp;
+    }
+}
+
+inline void launch_build_pivrows_from_ipiv(
+    int* d_piv_rows,
+    int m,
+    int k,
+    const int* d_ipiv,
+    cudaStream_t stream = 0)
+{
+    int threads = 256;
+    int blocks = (m + threads - 1) / threads;
+    init_piv_rows_kernel<<<blocks, threads, 0, stream>>>(d_piv_rows, m);
+    CUDA_CHECK(cudaGetLastError());
+
+    build_pivrows_from_ipiv_kernel<<<1, 1, 0, stream>>>(d_piv_rows, m, k, d_ipiv);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
 // 测试函数
 // ============================================================================
 
@@ -179,11 +227,9 @@ TestResult test_matrix_lu(
 
     half* dA_half  = nullptr;
     half* dA0_half = nullptr;
-    int*  d_ipiv_rel = nullptr;
 
     CUDA_CHECK(cudaMalloc(&dA_half,  sizeof(half) * (size_t)lda * n));
     CUDA_CHECK(cudaMalloc(&dA0_half, sizeof(half) * (size_t)lda * n));
-    CUDA_CHECK(cudaMalloc(&d_ipiv_rel, sizeof(int) * (size_t)std::max(m, n)));
 
     CUDA_CHECK(cudaMemcpy(dA0_half, hA0_half.data(),
                           sizeof(half) * (size_t)lda * n,
@@ -196,6 +242,13 @@ TestResult test_matrix_lu(
     hgetrfSetCublas(h, cublas);
 
     const int panel_width = 128;
+    const int k_total = std::min(m, n);
+
+    // ipiv (global, 1-based) + info(device scalar)
+    int* d_ipiv = nullptr;
+    int* d_info = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_ipiv, sizeof(int) * (size_t)k_total));
+    CUDA_CHECK(cudaMalloc(&d_info, sizeof(int)));
 
     size_t lwork = 0;
     hgetrf_bufferSize(h, m, n, lda, panel_width, &lwork);
@@ -203,11 +256,8 @@ TestResult test_matrix_lu(
     void* d_work = nullptr;
     CUDA_CHECK(cudaMalloc(&d_work, lwork));
 
-    int* d_piv_rows = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_piv_rows, sizeof(int) * (size_t)m));
-
     printf("\n========================================\n");
-    printf("Half 精度 LU 分解测试 (workspace 外置, cuSOLVER-like)\n");
+    printf("Half 精度 LU 分解测试 (cuSOLVER-like)\n");
     printf("========================================\n");
     printf("矩阵规模: %d × %d\n", m, n);
     printf("panel宽度: %d\n", panel_width);
@@ -216,7 +266,7 @@ TestResult test_matrix_lu(
     printf("workspace: %zu bytes\n", lwork);
     printf("========================================\n");
 
-    // Warmup
+    // Warmup (copy 不计时)
     if (warmup > 0) {
         printf("\n[Warmup] %d iterations...\n", warmup);
         for (int w = 0; w < warmup; ++w) {
@@ -224,58 +274,66 @@ TestResult test_matrix_lu(
                                   sizeof(half) * (size_t)lda * n,
                                   cudaMemcpyDeviceToDevice));
 
-            int info = 0;
             hgetrf(h, m, n, dA_half, lda,
-                  panel_width, uc,
-                  d_ipiv_rel,
-                  d_piv_rows,
-                  d_work, lwork,
-                  &info);
+                   panel_width, uc,
+                   d_ipiv, d_info,
+                   d_work, lwork);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("[Warmup] Complete!\n");
     }
 
-    // Performance test
+    // Performance test：只计 hgetrf，不计 memcpy
     cudaEvent_t ev_start, ev_stop;
     CUDA_CHECK(cudaEventCreate(&ev_start));
     CUDA_CHECK(cudaEventCreate(&ev_stop));
 
     printf("\n[Performance] Running %d iterations...\n", iters);
-    CUDA_CHECK(cudaEventRecord(ev_start));
+
+    float total_ms = 0.0f;
+
     for (int it = 0; it < iters; ++it) {
+        // 这次 memcpy 不计时（但仍然执行，保证每次输入一致）
         CUDA_CHECK(cudaMemcpy(dA_half, dA0_half,
                               sizeof(half) * (size_t)lda * n,
                               cudaMemcpyDeviceToDevice));
 
-        int info = 0;
+        CUDA_CHECK(cudaEventRecord(ev_start));
         hgetrf(h, m, n, dA_half, lda,
-              panel_width, uc,
-              d_ipiv_rel,
-              d_piv_rows,
-              d_work, lwork,
-              &info);
-    }
-    CUDA_CHECK(cudaEventRecord(ev_stop));
-    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+               panel_width, uc,
+               d_ipiv, d_info,
+               d_work, lwork);
+        CUDA_CHECK(cudaEventRecord(ev_stop));
+        CUDA_CHECK(cudaEventSynchronize(ev_stop));
 
-    float total_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&total_ms, ev_start, ev_stop));
+        float iter_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&iter_ms, ev_start, ev_stop));
+        total_ms += iter_ms;
+    }
+
     result.avg_time_ms = total_ms / iters;
 
+    // FLOPs（方阵公式近似仍然沿用你的）
     double total_flops = (1.0) * m * n * n - (1.0 / 3.0) * n * n * n;
     result.gflops = (total_flops * 1e-9) / (result.avg_time_ms * 1e-3);
 
     printf("[Performance] Complete!\n");
-    printf("\n性能指标:\n");
+    printf("\n性能指标 (仅 LU 内核，不含 memcpy):\n");
     printf("  平均时间: %.4f ms\n", result.avg_time_ms);
     printf("  性能:     %.2f GFLOP/s\n", result.gflops);
 
-    // Profiling（这里保留 verbose 输出，但我们这个版本不做内部 timers）
+    // Profiling
     printf("\n[Profiling] (本版本不在 hgetrf 内部做分段 timers；建议用 Nsight)\n");
     (void)verbose;
 
-    // Accuracy test - 使用性能测试最后一次迭代的 dA_half & d_piv_rows
+    // Read info
+    int h_info = 0;
+    CUDA_CHECK(cudaMemcpy(&h_info, d_info, sizeof(int), cudaMemcpyDeviceToHost));
+    if (h_info != 0) {
+        printf("\n[Warning] LU 分解检测到奇异主元：info = %d (1-based)\n", h_info);
+    }
+
+    // Accuracy test - 使用最后一次迭代的 dA_half + d_ipiv
     printf("\n[Accuracy] 验证分解正确性...\n");
 
     half* dL_half  = nullptr;
@@ -290,7 +348,7 @@ TestResult test_matrix_lu(
     CUDA_CHECK(cudaMalloc(&dLU_half, sizeof(half) * (size_t)lda * n));
     CUDA_CHECK(cudaMalloc(&dR_half,  sizeof(half) * (size_t)lda * n));
 
-    // 构建L和U
+    // 构建 L 和 U
     {
         dim3 block(128);
         dim3 grid(n, (m + block.x - 1) / block.x);
@@ -298,7 +356,12 @@ TestResult test_matrix_lu(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // 构建PA：直接用 device piv_rows
+    // 从 ipiv 构造 piv_rows（仅用于验证）
+    int* d_piv_rows = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_piv_rows, sizeof(int) * (size_t)m));
+    launch_build_pivrows_from_ipiv(d_piv_rows, m, k_total, d_ipiv, 0);
+
+    // 构建 PA：用 piv_rows
     {
         dim3 block(128);
         dim3 grid(n, (m + block.x - 1) / block.x);
@@ -306,10 +369,11 @@ TestResult test_matrix_lu(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // 计算LU = L * U
+    // LU = L * U
     {
         float alpha = 1.0f;
         float beta  = 0.0f;
+        CUBLAS_CHECK(cublasSetStream(cublas, 0));
         CUBLAS_CHECK(
             cublasGemmEx(cublas,
                          CUBLAS_OP_N, CUBLAS_OP_N,
@@ -323,7 +387,7 @@ TestResult test_matrix_lu(
                          CUBLAS_GEMM_DEFAULT));
     }
 
-    // 计算残差 R = PA - LU
+    // 残差 R = PA - LU
     {
         dim3 block(128);
         dim3 grid(n, (m + block.x - 1) / block.x);
@@ -373,12 +437,15 @@ TestResult test_matrix_lu(
     CUDA_CHECK(cudaFree(dLU_half));
     CUDA_CHECK(cudaFree(dR_half));
 
+    CUDA_CHECK(cudaFree(d_piv_rows));
+
     CUDA_CHECK(cudaFree(dA_half));
     CUDA_CHECK(cudaFree(dA0_half));
-    CUDA_CHECK(cudaFree(d_ipiv_rel));
+
+    CUDA_CHECK(cudaFree(d_ipiv));
+    CUDA_CHECK(cudaFree(d_info));
 
     CUDA_CHECK(cudaFree(d_work));
-    CUDA_CHECK(cudaFree(d_piv_rows));
 
     hgetrfDestroy(h);
 
@@ -461,7 +528,6 @@ int main(int argc, char** argv)
         cfg.iters, cfg.warmup,
         handle, cfg.verbose);
 
-    // 你原来的清理保留
     cleanup_panel_buffers();
     cleanup_exchange_buffers();
     CUBLAS_CHECK(cublasDestroy(handle));

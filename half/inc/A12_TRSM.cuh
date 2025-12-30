@@ -4,6 +4,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <cstdio>
+#include <cstdlib>
+#include <type_traits>
 
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(call)                                                       \
@@ -51,8 +54,6 @@ __global__ void A12_trsm_kernel_half_opt(
     const half h_zero = __float2half(0.0f);
 
     // 1) 把 L11 从 global 载入 shared(half)
-    //
-    // L11: rows i=j0..j0+ib-1, cols j=j0..j0+ib-1
     for (int col = threadIdx.x; col < ib; col += blockDim.x) {
         int gj = j0 + col;
         if (gj >= n) continue;
@@ -71,9 +72,8 @@ __global__ void A12_trsm_kernel_half_opt(
     int j_trail = blockIdx.x * blockDim.x + threadIdx.x;
     if (j_trail >= ntrail) return;
 
-    int j = col0 + j_trail;  // 绝对列号
+    int j = col0 + j_trail;
 
-    // 顶部 ib 行，这一列拷贝到寄存器 (float，FP32 累加，更稳更快)
     float x[IB];
 
     #pragma unroll
@@ -93,18 +93,17 @@ __global__ void A12_trsm_kernel_half_opt(
         x[ii] = v;
     }
 
-    // 3) 前代：L11 * x = A12(:, j)，diag(L)=1
+    // 3) forward substitution
     #pragma unroll
     for (int ii = 0; ii < IB; ++ii) {
         if (ii >= ib) break;
 
         float sum = x[ii];
 
-        // sum -= L(ii,0..ii-1) * x(0..ii-1)
         #pragma unroll
         for (int kk = 0; kk < IB; ++kk) {
             if (kk >= ii) break;
-            half Lik_h = L11_sh[ii * stride + kk];  // L11(ii,kk)
+            half Lik_h = L11_sh[ii * stride + kk];
             float Lik  = __half2float(Lik_h);
             float xk   = x[kk];
             sum -= Lik * xk;
@@ -113,7 +112,7 @@ __global__ void A12_trsm_kernel_half_opt(
         x[ii] = sum;
     }
 
-    // 4) 写回顶部 ib 行（cast 回 half 存储）
+    // 4) store back
     #pragma unroll
     for (int ii = 0; ii < IB; ++ii) {
         if (ii >= ib) break;
@@ -124,27 +123,28 @@ __global__ void A12_trsm_kernel_half_opt(
     }
 }
 
-// fallback 版本：不用 shared 的通用实现（原来是全 half，这里也改成 FP32 累加）
-// 用于 ib 不是 32/64/128
+
+// fallback 版本：不用 shared 的通用实现
+// 重要：这里明确只支持 ib <= 128（因为本 kernel 用了固定长度数组）
 __global__ void A12_trsm_kernel_half_fallback(
     half* __restrict__ A,
     int m, int n, int lda,
     int j0, int ib)
 {
+    if (ib <= 0 || ib > 128) return;
+
     int col0   = j0 + ib;
     int ntrail = n - col0;
-    if (ntrail <= 0 || ib <= 0) return;
+    if (ntrail <= 0) return;
 
     int j_trail = blockIdx.x * blockDim.x + threadIdx.x;
     if (j_trail >= ntrail) return;
 
-    int j = col0 + j_trail;  // 绝对列号
+    int j = col0 + j_trail;
 
     const half h_zero = __float2half(0.0f);
 
-    // forward substitution 直接在 global 上搞，简单但带宽差点
-    // 使用 float 作为寄存器中的工作精度（FP32 累加）
-    float x[128]; // 假设 ib <= 128，够你现在的用法了
+    float x[128];
 
     // load
     for (int ii = 0; ii < ib; ++ii) {
@@ -164,13 +164,12 @@ __global__ void A12_trsm_kernel_half_fallback(
 
         float sum = x[ii];
 
-        for (int kk = 0; kk < ib; ++kk) {
-            if (kk >= ii) break;
-            int krow = j0 + kk;
+        for (int kk = 0; kk < ii; ++kk) {
+            int kcol = j0 + kk;
 
             half Lik_h = h_zero;
-            if (irow < m && (j0 + kk) < n) {
-                Lik_h = A[irow + (size_t)(j0 + kk) * lda];
+            if (irow < m && kcol < n) {
+                Lik_h = A[irow + (size_t)kcol * lda];
             }
             float Lik = __half2float(Lik_h);
             float xk  = x[kk];
@@ -181,7 +180,7 @@ __global__ void A12_trsm_kernel_half_fallback(
         x[ii] = sum;
     }
 
-    // store back（cast 回 half）
+    // store
     for (int ii = 0; ii < ib; ++ii) {
         int gi = j0 + ii;
         if (gi < m && j < n) {
@@ -189,6 +188,7 @@ __global__ void A12_trsm_kernel_half_fallback(
         }
     }
 }
+
 
 // 启动函数: A12(top) = L11^{-1} * A12(top)
 inline void launch_A12_trsm(
@@ -201,7 +201,14 @@ inline void launch_A12_trsm(
     int ntrail = n - col0;
     if (ntrail <= 0 || ib <= 0) return;
 
-    // grid: 每个线程一列 A12(:,j)，仅顶部 ib 行
+    // 保护：你的 opt/fallback 都默认支持到 128
+    if (ib > 128) {
+        // 这里你可以选择直接 exit（更像库行为），
+        // 也可以 return（静默跳过会更难 debug，所以我建议 exit）
+        fprintf(stderr, "[A12_TRSM] ERROR: ib=%d > 128 is not supported by custom TRSM.\n", ib);
+        std::exit(EXIT_FAILURE);
+    }
+
     const int block_x = 128;
     int grid_x = (ntrail + block_x - 1) / block_x;
     if (grid_x <= 0) grid_x = 1;
@@ -209,7 +216,6 @@ inline void launch_A12_trsm(
     dim3 grid(grid_x);
     dim3 block(block_x);
 
-    // shared 大小：IB*IB 个 half
     auto launch_opt = [&](auto IB_tag) {
         constexpr int IB = decltype(IB_tag)::value;
         size_t shmem_size = sizeof(half) * IB * IB;

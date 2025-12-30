@@ -5,6 +5,8 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <stdint.h>
+#include <cstdio>
+#include <cstdlib>
 
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(call)                                                       \
@@ -32,18 +34,13 @@
 
 using half = __half;
 
+// 如果你真的想让 GEMM 内部 setStream（不建议），可以打开这个宏
+// #define A22_GEMM_SET_STREAM_INSIDE 1
+
 /**
  * Tensor Core GEMM（带列范围）:
  *
  *  A22(col0:col0+n2-1) -= A21 * A12(col0:col0+n2-1)
- *
- *  其中:
- *    - panel 起点 j0，宽度 ib
- *    - A21: 行 [j0+ib .. m-1], 列 [j0 .. j0+ib-1]
- *    - A12: 行 [j0 .. j0+ib-1], 列 [col0 .. col0+n2-1]
- *    - A22: 行 [j0+ib .. m-1], 列 [col0 .. col0+n2-1]
- *
- *  对于 full GEMM，只要 col0 = j0+ib, n2 = n - col0 即可。
  */
 inline void launch_A22_gemm_tc_range(
     half* dA,
@@ -69,7 +66,13 @@ inline void launch_A22_gemm_tc_range(
     const float alpha = -1.0f;
     const float beta  =  1.0f;
 
+#if defined(A22_GEMM_SET_STREAM_INSIDE)
     CUBLAS_CHECK(cublasSetStream(handle, stream));
+#else
+    // 期望外层已经把 handle 的 stream 设置为 stream
+    (void)stream;
+#endif
+
     CUBLAS_CHECK(
         cublasGemmEx(
             handle,
@@ -86,10 +89,9 @@ inline void launch_A22_gemm_tc_range(
             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
+
 /**
- * 教学/回退版 naive GEMM（一次性完整 tail）
- *
- *  这里为简单起见，保留原有接口，不再细抠性能。
+ * naive GEMM（一次性完整 tail）
  */
 __global__ void A22_gemm_naive_kernel(
     half* __restrict__ A,
@@ -109,7 +111,6 @@ __global__ void A22_gemm_naive_kernel(
     int i = row0 + i_rel;
     int j = col0 + j_rel;
 
-    // C(i,j) -= sum_k A21(i,k) * A12(k,j)
     float sum = 0.0f;
     for (int k = 0; k < ib; ++k) {
         int kcol = j0 + k;
