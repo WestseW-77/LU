@@ -30,8 +30,7 @@ static __device__ __forceinline__ half half_abs(half x) {
     return __habs(x);
 }
 
-// ============================================================================
-// panel 内的 pivot prescale swap
+// panel 内 pivot prescale swap 的 协作组内核
 __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     half* __restrict__ A,
     int m, int lda,
@@ -40,7 +39,7 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     half* __restrict__ block_val,
     int*  __restrict__ block_idx,
     int num_blocks,
-    int* __restrict__ d_ipiv) // 全局 ipiv: 1-based pivot row index
+    int* __restrict__ d_ipiv) // 传输出去的都是 1-based
 {
     extern __shared__ unsigned char smem[];
     const int tid      = threadIdx.x;
@@ -48,39 +47,34 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     const int warp_id  = tid / WARP_SIZE;
     const int num_warps = blockDim.x / WARP_SIZE;
 
-    // shared: [half vals][int idx]
+    // shared memory 前段为值后段为索引
     half* s_val = reinterpret_cast<half*>(smem);
     int*  s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
 
+    // 本 panel 处理的列和行
     const int col_k = j0 + k;
     const int row_k = j0 + k;
 
-    // 越界保护（和你原逻辑一致：col_k>=m 就停）
     if (col_k >= m) {
-        // cooperative kernel 里最好别让不同 block 走不同返回路径进入 grid.sync
-        // 但这里 col_k>=m 时，后续也不会进入 grid.sync 的必要区域（launch 端会 break）
         return;
     }
 
-    // -------------------------------
-    // (1) 每线程扫描自己负责的行区间，得到 local max
-    // -------------------------------
     half local_max_val = __float2half(0.0f);
     int  local_max_idx = row_k;
 
     const int global_stride = blockDim.x * gridDim.x;
+    
+    // 每个线程得到自己所负责数据中最大值
     for (int idx = row_k + blockIdx.x * blockDim.x + tid; idx < m; idx += global_stride) {
         half a = A[idx + (size_t)col_k * lda];
         half v = half_abs(a);
         if (v > local_max_val) {
             local_max_val = v;
-            local_max_idx = idx;  // 0-based absolute row
+            local_max_idx = idx;  // 计算过程中拿到的索引是 0-based
         }
     }
 
-    // -------------------------------
-    // (2) warp reduce max
-    // -------------------------------
+    //  整个 warp 内得到 warp 内的最大值
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         half other_val = __shfl_down_sync(0xffffffff, local_max_val, offset);
         int  other_idx = __shfl_down_sync(0xffffffff, local_max_idx, offset);
@@ -96,9 +90,7 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     }
     __syncthreads();
 
-    // -------------------------------
-    // (3) block reduce max (warp0)
-    // -------------------------------
+    // 整个 block 得到 block 内的最大值
     if (warp_id == 0) {
         half warp_max = (lane < num_warps) ? s_val[lane] : __float2half(0.0f);
         int  warp_idx = (lane < num_warps) ? s_idx[lane] : row_k;
@@ -121,9 +113,7 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     cg::grid_group grid = cg::this_grid();
     grid.sync();
 
-    // -------------------------------
-    // (4) grid-level reduce: block0 收集所有 block 的候选 pivot
-    // -------------------------------
+    // 用一个 block 来得到所有 block 中的最大值
     if (blockIdx.x == 0) {
         half max_val = __float2half(0.0f);
         int  max_idx = row_k;
@@ -152,25 +142,19 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
         }
 
         if (tid == 0) {
-            d_ipiv[row_k] = s_idx[0] + 1; // 1-based
+            d_ipiv[row_k] = s_idx[0] + 1; // 写回全局时需要转换到 1-based
         }
     }
 
-    // 确保所有 blocks 都能看到 d_ipiv[row_k]
     grid.sync();
 
-    // -------------------------------
-    // (5) prescale: 用 pivot 做 L 列（发生在 swap 之前，保持你原语义）
-    //     关键逻辑：pivot_row != row_k 时，需要跳过 pivot_row；
-    //              但需要包含 row_k（因为 swap 后 row_k 会下沉到 pivot_row，应该是 multiplier）
-    // -------------------------------
-    const int pivot_row = d_ipiv[row_k] - 1; // to 0-based
+    // 高斯消元
+    const int pivot_row = d_ipiv[row_k] - 1; // 计算时转换回 0-based
     const half pivot = A[pivot_row + (size_t)col_k * lda];
     if (pivot == __float2half(0.0f)) {
-        // 奇异：直接退出（info 的检测由外层统一做）
         return;
     }
-
+    // pivot 选择的不需要交换
     if (pivot_row == row_k) {
         for (int r = row_k + 1 + blockIdx.x * blockDim.x + tid; r < m; r += global_stride) {
             half val = A[r + (size_t)col_k * lda];
@@ -223,15 +207,10 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
             }
         }
     }
-
-    // 这里不再做 grid.sync：kernel 结束本身是一个全局完成点（对同 stream 的后续 kernel）。
-    // 再加一次全 grid barrier 只会让你更慢。
 }
 
 
-// ============================================================================
-// 更新后续矩阵（panel 内更新）
-// ============================================================================
+// panel 内后续矩阵更新
 __global__ void panel_update_kernel_vec(
     half* __restrict__ A,
     int m, int lda,
