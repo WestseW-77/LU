@@ -1,20 +1,4 @@
-// A1_panel.cuh  (next-step optimization: swap-first then prescale; removes one grid.sync)
-// External API unchanged.
-// Core change in cooperative kernel:
-//
-// BEFORE (your baseline):
-//   grid-reduce -> publish pivot_row -> grid.sync
-//   prescale (all blocks) -> grid.sync
-//   swap (block0)
-//
-// NOW (this version):
-//   grid-reduce -> publish pivot_row -> grid.sync
-//   swap (block0, panel columns) -> grid.sync   <-- only one post-publish barrier
-//   prescale (all blocks)                        <-- no barrier needed after; kernel end is fence
-//
-// This eliminates one expensive grid-wide barrier per k and also switches to the
-// numerically standard ordering (swap first, then compute multipliers).
-
+// A1_panel.cuh
 #pragma once
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -57,9 +41,7 @@ using half = __half;
 
 static __device__ __forceinline__ half half_abs(half x) { return __habs(x); }
 
-////////////////////////////////////////////////////////////////////////////////
-// 1) cooperative pivot + panel swap + prescale
-////////////////////////////////////////////////////////////////////////////////
+// panel 内的 pivot prescale swap 的协作组内核
 __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     half* __restrict__ A,
     int m, int lda,
@@ -68,7 +50,7 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     half* __restrict__ block_val,
     int*  __restrict__ block_idx,
     int num_blocks,
-    int* __restrict__ d_ipiv) // 1-based output for outer code
+    int* __restrict__ d_ipiv) // 输出时要为 cusolver 的 1-based
 {
     extern __shared__ unsigned char smem[];
     const int tid      = threadIdx.x;
@@ -79,11 +61,12 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     half* s_val = reinterpret_cast<half*>(smem);
     int*  s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
 
+    // 当前操作的列和行
     const int col_k = j0 + k;
     const int row_k = j0 + k;
     if (col_k >= m) return;
 
-    // (1) thread-local scan
+    // 线程找到自己负责数据中的最大值
     half local_max_val = __float2half(0.0f);
     int  local_max_idx = row_k;
 
@@ -94,7 +77,7 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
         if (v > local_max_val) { local_max_val = v; local_max_idx = idx; }
     }
 
-    // (2) warp reduce
+    // warp 内规约出 warp 内的最大值
     for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
         half ov = __shfl_down_sync(0xffffffff, local_max_val, off);
         int  oi = __shfl_down_sync(0xffffffff, local_max_idx, off);
@@ -103,7 +86,7 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     if (lane == 0) { s_val[warp_id] = local_max_val; s_idx[warp_id] = local_max_idx; }
     __syncthreads();
 
-    // (3) block reduce (warp0)
+    // block 内规约出 block 内的最大值
     if (warp_id == 0) {
         half vmax = (lane < num_warps) ? s_val[lane] : __float2half(0.0f);
         int  vidx = (lane < num_warps) ? s_idx[lane] : row_k;
@@ -111,15 +94,20 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
             half ov = __shfl_down_sync(0xffffffff, vmax, off);
             int  oi = __shfl_down_sync(0xffffffff, vidx, off);
-            if (ov > vmax) { vmax = ov; vidx = oi; }
+            if (ov > vmax) { 
+                vmax = ov; 
+                vidx = oi; 
+            }
         }
-        if (lane == 0) { block_val[blockIdx.x] = vmax; block_idx[blockIdx.x] = vidx; }
+        if (lane == 0) { 
+            block_val[blockIdx.x] = vmax; block_idx[blockIdx.x] = vidx; 
+        }
     }
 
     cg::grid_group grid = cg::this_grid();
     grid.sync();
 
-    // (4) grid reduce in block0 -> write ipiv (output) + publish pivot_row (internal)
+    // grid 内规约得到最大值
     if (blockIdx.x == 0) {
         half vmax = __float2half(0.0f);
         int  vidx = row_k;
@@ -144,17 +132,16 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
 
         if (tid == 0) {
             const int piv = s_idx[0];   // 0-based
-            d_ipiv[row_k] = piv + 1;    // output for outer use
-            block_idx[0]  = piv;        // publish pivot_row for internal use
+            d_ipiv[row_k] = piv + 1;    // 1-based
+            block_idx[0]  = piv;
         }
     }
 
-    // make pivot_row visible
     grid.sync();
 
     const int pivot_row = block_idx[0]; // 0-based
 
-    // (5) swap FIRST (panel columns only), then sync so all blocks see swapped A
+    // panel 内 swap
     if (blockIdx.x == 0 && pivot_row != row_k) {
         for (int j = j0 + tid; j < j0 + ib; j += blockDim.x) {
             size_t off = (size_t)j * lda;
@@ -167,36 +154,36 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
     // ensure swap completed before prescale reads pivot and column
     grid.sync();
 
-    // (6) prescale AFTER swap: standard LU multipliers
-    // pivot is now at A[row_k, col_k]
+    // 高斯消元
     const half pivot = A[row_k + (size_t)col_k * lda];
-    if (pivot == __float2half(0.0f)) return;
+    if (pivot == __float2half(0.0f)) 
+        return;
 
     for (int r = row_k + 1 + blockIdx.x * blockDim.x + tid; r < m; r += global_stride) {
         A[r + (size_t)col_k * lda] = __hdiv(A[r + (size_t)col_k * lda], pivot);
     }
-    // no extra grid.sync: kernel end is a completion point for subsequent kernels in the stream
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// 2) panel-internal update (per k), half2 on rows, COL_TILE columns per block
-////////////////////////////////////////////////////////////////////////////////
+// panel 内 update
 template<int ROW_TILE, int COL_TILE>
 __global__ void panel_update_kernel_range_tiled_half2(
     half* __restrict__ A,
     int m, int lda,
     int j0,
-    int col_end, // absolute exclusive
+    int col_end, // panel 列结束范围
     int k)
 {
+    // 当前操作的列和行
     const int col_k = j0 + k;
     const int row_k = j0 + k;
-    if (col_k >= m) return;
+    if (col_k >= m) 
+        return;
 
     const int c0 = (col_k + 1) + (int)blockIdx.x * COL_TILE;
 
     const int r0 = (row_k + 1) + (int)blockIdx.y * ROW_TILE + ((int)threadIdx.x * 2);
-    if (r0 >= m) return;
+    if (r0 >= m) 
+        return;
 
     half2 L2;
     L2.x = __ldg(&A[(r0 + 0) + (size_t)col_k * lda]);
@@ -205,7 +192,8 @@ __global__ void panel_update_kernel_range_tiled_half2(
     #pragma unroll
     for (int t = 0; t < COL_TILE; ++t) {
         const int c = c0 + t;
-        if (c >= col_end) break;
+        if (c >= col_end) 
+            break;
 
         const half U  = __ldg(&A[row_k + (size_t)c * lda]);
         const half2 U2 = __half2half2(U);
@@ -221,10 +209,7 @@ __global__ void panel_update_kernel_range_tiled_half2(
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// 3) TRSM for panel-only U12 formation: U12 = L11^{-1} * A12 (K<=32)
-//    One warp per RHS column.
-////////////////////////////////////////////////////////////////////////////////
+// A12 的 TRSM 内核
 template<int K_MAX>
 __global__ void panel_trsm_u12_warp_kernel(
     const half* __restrict__ A,
@@ -269,34 +254,12 @@ __global__ void panel_trsm_u12_warp_kernel(
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// 4) cuBLAS handle (cached; only GEMM used)
-////////////////////////////////////////////////////////////////////////////////
-static inline cublasHandle_t& panel_cublas_handle_ref() { static cublasHandle_t h = nullptr; return h; }
-static inline int& panel_cublas_dev_ref() { static int dev = -1; return dev; }
-
-static inline cublasHandle_t panel_get_cublas_handle()
-{
-    int dev = 0;
-    CUDA_CHECK(cudaGetDevice(&dev));
-    cublasHandle_t& h = panel_cublas_handle_ref();
-    int& cached = panel_cublas_dev_ref();
-
-    if (!h || cached != dev) {
-        if (h) { cublasDestroy(h); h = nullptr; }
-        CUBLAS_CHECK(cublasCreate(&h));
-        cached = dev;
-    }
-    return h;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// 5) panel-only block-out update for a kb block: TRSM(U12) + GEMM(A22)
-////////////////////////////////////////////////////////////////////////////////
+// A22 部分更新
 static inline void panel_blockout_trsm_gemm_inside_panel(
     half* A, int m, int lda,
     int j0, int ib,
     int k0, int kend,
+    cublasHandle_t cublas_handle,
     cudaStream_t stream)
 {
     const int j0_k0 = j0 + k0;
@@ -307,7 +270,8 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
     const int N = (j0 + ib) - col2;
     const int M = m - row2;
 
-    if (K <= 0 || N <= 0) return;
+    if (K <= 0 || N <= 0) 
+        return;
     if (K > 32) {
         fprintf(stderr, "panel_blockout_trsm_gemm_inside_panel: K=%d > 32 not supported.\n", K);
         std::exit(EXIT_FAILURE);
@@ -331,11 +295,15 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
     const float alpha = -1.0f;
     const float beta  =  1.0f;
 
-    cublasHandle_t h = panel_get_cublas_handle();
-    CUBLAS_CHECK(cublasSetStream(h, stream));
+    if (!cublas_handle) {
+        fprintf(stderr,
+                "panel_blockout_trsm_gemm_inside_panel: cublas_handle is null. "
+                "Please create a cublasHandle_t outside and pass it in.\n");
+        std::exit(EXIT_FAILURE);
+    }
 
     CUBLAS_CHECK(cublasGemmEx(
-        h,
+        cublas_handle,
         CUBLAS_OP_N, CUBLAS_OP_N,
         M, N, K,
         &alpha,
@@ -347,13 +315,12 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// 6) required pivot blocks
-////////////////////////////////////////////////////////////////////////////////
+// 计算需要的 block 数
 inline int panel_TSLU_required_pivot_blocks(int m, int j0)
 {
     const int m_effective = m - j0;
-    if (m_effective <= 0) return 1;
+    if (m_effective <= 0) 
+        return 1;
 
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
@@ -382,21 +349,29 @@ inline int panel_TSLU_required_pivot_blocks(int m, int j0)
     if (max_coop_grid < 1) max_coop_grid = 1;
 
     int rows_per_block;
-    if (m_effective >= 24576) rows_per_block = 1024;
-    else if (m_effective >= 12288) rows_per_block = 512;
-    else if (m_effective >= 4096)  rows_per_block = 256;
-    else rows_per_block = 128;
+    if (m_effective >= 24576) 
+        rows_per_block = 1024;
+    else if (m_effective >= 12288) 
+        rows_per_block = 512;
+    else if (m_effective >= 4096)  
+        rows_per_block = 256;
+    else 
+        rows_per_block = 128;
 
     int num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
-    if (num_blocks < 1) num_blocks = 1;
-    if (num_blocks > 64) num_blocks = 64;
+    if (num_blocks < 1) 
+        num_blocks = 1;
+    if (num_blocks > 64) 
+        num_blocks = 64;
 
     if (num_blocks > max_coop_grid) {
         int min_rows_per_block = (m_effective + max_coop_grid - 1) / max_coop_grid;
-        if (min_rows_per_block < 1) min_rows_per_block = 1;
+        if (min_rows_per_block < 1) 
+            min_rows_per_block = 1;
         rows_per_block = min_rows_per_block;
         num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
-        if (num_blocks < 1) num_blocks = 1;
+        if (num_blocks < 1) 
+            num_blocks = 1;
     }
 
     if (num_blocks > max_coop_grid) {
@@ -409,14 +384,7 @@ inline int panel_TSLU_required_pivot_blocks(int m, int j0)
     return num_blocks;
 }
 
-inline size_t panel_TSLU_workspace_bytes_from_blocks(int num_blocks_pivot)
-{
-    return (size_t)num_blocks_pivot * (sizeof(half) + sizeof(int));
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// 7) external interface (UNCHANGED)
-////////////////////////////////////////////////////////////////////////////////
+// 外部调用接口
 inline void launch_panel_TSLU(
     half* A,
     int   m,
@@ -425,6 +393,7 @@ inline void launch_panel_TSLU(
     int   ib,
     int   uc,
     int*  d_ipiv,          // 1-based output
+    cublasHandle_t cublas_handle,
     cudaStream_t stream,
     half* d_block_val,
     int*  d_block_idx,
@@ -432,6 +401,10 @@ inline void launch_panel_TSLU(
 {
     if (!A || !d_ipiv || !d_block_val || !d_block_idx) {
         fprintf(stderr, "launch_panel_TSLU: null pointer input.\n");
+        std::exit(EXIT_FAILURE);
+    }
+    if (!cublas_handle) {
+        fprintf(stderr, "launch_panel_TSLU: cublas_handle is null.\n");
         std::exit(EXIT_FAILURE);
     }
     if (ib <= 0) return;
@@ -493,15 +466,13 @@ inline void launch_panel_TSLU(
             }
         }
 
-        panel_blockout_trsm_gemm_inside_panel(A, m, lda, j0, ib, k0, kend, stream);
+        panel_blockout_trsm_gemm_inside_panel(
+            A, m, lda, j0, ib, k0, kend,
+            cublas_handle,
+            stream);
     }
 
     CUDA_CHECK(cudaGetLastError());
 }
 
-inline void cleanup_panel_buffers()
-{
-    cublasHandle_t& h = panel_cublas_handle_ref();
-    if (h) { cublasDestroy(h); h = nullptr; }
-    panel_cublas_dev_ref() = -1;
-}
+// panel kernels do not own any global/static resources.

@@ -239,10 +239,11 @@ TestResult test_matrix_lu(
     hgetrfHandle_t h = nullptr;
     hgetrfCreate(&h);
     hgetrfSetStream(h, 0);
-    hgetrfSetCublas(h, cublas);
 
     const int panel_width = 128;
     const int k_total = std::min(m, n);
+    hgetrfSetPanelWidth(h, panel_width);
+    hgetrfSetUc(h, uc);
 
     // ipiv (global, 1-based) + info(device scalar)
     int* d_ipiv = nullptr;
@@ -250,11 +251,10 @@ TestResult test_matrix_lu(
     CUDA_CHECK(cudaMalloc(&d_ipiv, sizeof(int) * (size_t)k_total));
     CUDA_CHECK(cudaMalloc(&d_info, sizeof(int)));
 
-    size_t lwork = 0;
-    hgetrf_bufferSize(h, m, n, lda, panel_width, &lwork);
-
-    void* d_work = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_work, lwork));
+    int lwork = 0;
+    hgetrf_bufferSize(h, m, n, dA_half, lda, &lwork);
+    half* d_work = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_work, sizeof(half) * (size_t)lwork));
 
     printf("\n========================================\n");
     printf("Half 精度 LU 分解测试 (cuSOLVER-like)\n");
@@ -263,7 +263,7 @@ TestResult test_matrix_lu(
     printf("panel宽度: %d\n", panel_width);
     printf("微块大小: %d\n", uc);
     printf("迭代次数: %d (warmup: %d)\n", iters, warmup);
-    printf("workspace: %zu bytes\n", lwork);
+    printf("workspace: %d half elements (%zu bytes)\n", lwork, sizeof(half) * (size_t)lwork);
     printf("========================================\n");
 
     // Warmup (copy 不计时)
@@ -273,11 +273,11 @@ TestResult test_matrix_lu(
             CUDA_CHECK(cudaMemcpy(dA_half, dA0_half,
                                   sizeof(half) * (size_t)lda * n,
                                   cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemsetAsync(d_info, 0, sizeof(int), 0));
 
             hgetrf(h, m, n, dA_half, lda,
-                   panel_width, uc,
-                   d_ipiv, d_info,
-                   d_work, lwork);
+                   d_work,
+                   d_ipiv, d_info);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("[Warmup] Complete!\n");
@@ -297,12 +297,12 @@ TestResult test_matrix_lu(
         CUDA_CHECK(cudaMemcpy(dA_half, dA0_half,
                               sizeof(half) * (size_t)lda * n,
                               cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemsetAsync(d_info, 0, sizeof(int), 0));
 
         CUDA_CHECK(cudaEventRecord(ev_start));
         hgetrf(h, m, n, dA_half, lda,
-               panel_width, uc,
-               d_ipiv, d_info,
-               d_work, lwork);
+               d_work,
+               d_ipiv, d_info);
         CUDA_CHECK(cudaEventRecord(ev_stop));
         CUDA_CHECK(cudaEventSynchronize(ev_stop));
 
@@ -444,7 +444,6 @@ TestResult test_matrix_lu(
 
     CUDA_CHECK(cudaFree(d_ipiv));
     CUDA_CHECK(cudaFree(d_info));
-
     CUDA_CHECK(cudaFree(d_work));
 
     hgetrfDestroy(h);
@@ -527,9 +526,6 @@ int main(int argc, char** argv)
         hA0_half, m, n, lda, cfg.uc,
         cfg.iters, cfg.warmup,
         handle, cfg.verbose);
-
-    cleanup_panel_buffers();
-    cleanup_exchange_buffers();
     CUBLAS_CHECK(cublasDestroy(handle));
 
     printf("\n========================================\n");

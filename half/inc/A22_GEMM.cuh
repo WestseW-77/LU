@@ -4,7 +4,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include <stdint.h>
 #include <cstdio>
 #include <cstdlib>
 
@@ -36,6 +35,9 @@ using half = __half;
 
 // 如果你真的想让 GEMM 内部 setStream（不建议），可以打开这个宏
 // #define A22_GEMM_SET_STREAM_INSIDE 1
+#if defined(A22_GEMM_SET_STREAM_INSIDE)
+#error "A22_GEMM_SET_STREAM_INSIDE is not supported: set the stream on the cublas handle outside for accurate timing."
+#endif
 
 /**
  * Tensor Core GEMM（带列范围）:
@@ -93,6 +95,7 @@ inline void launch_A22_gemm_tc_range(
 /**
  * naive GEMM（一次性完整 tail）
  */
+#if defined(HGETRF_ENABLE_GEMM_FALLBACK)
 __global__ void A22_gemm_naive_kernel(
     half* __restrict__ A,
     int m, int n, int lda,
@@ -155,10 +158,12 @@ inline void launch_A22_gemm_naive_range(
     );
     CUDA_CHECK(cudaGetLastError());
 }
+#endif
 
 /**
  * 兼容老接口：一次性更新整个 tail
  */
+#if defined(HGETRF_ENABLE_LEGACY_A22_GEMM_API)
 inline void launch_A22_gemm_tc(
     half* dA,
     int   m, int n, int lda,
@@ -171,6 +176,7 @@ inline void launch_A22_gemm_tc(
     launch_A22_gemm_tc_range(dA, m, n, lda, j0, ib, col0, n2, handle, stream);
 }
 
+#if defined(HGETRF_ENABLE_GEMM_FALLBACK)
 inline void launch_A22_gemm_naive(
     half* dA,
     int   m, int n, int lda,
@@ -181,3 +187,5 @@ inline void launch_A22_gemm_naive(
     int n2   = n - col0;
     launch_A22_gemm_naive_range(dA, m, n, lda, j0, ib, col0, n2, stream);
 }
+#endif
+#endif

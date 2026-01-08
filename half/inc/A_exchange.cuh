@@ -92,25 +92,4 @@ inline void launch_A_exchange_trailing_device_piv(
     CUDA_CHECK(cudaGetLastError());
 }
 
-// ============================================================================
-// 兼容旧接口：直接报错，避免偷偷 malloc/memcpy
-// ============================================================================
-inline void launch_A_exchange_trailing(
-    half* dA,
-    int m, int n, int lda,
-    int j0, int ib,
-    const int* h_ipiv_rel,
-    cudaStream_t stream = 0)
-{
-    (void)dA; (void)m; (void)n; (void)lda;
-    (void)j0; (void)ib;
-    (void)h_ipiv_rel;
-    (void)stream;
-
-    fprintf(stderr,
-            "[A_exchange] ERROR: launch_A_exchange_trailing(host piv) is removed. "
-            "Use launch_A_exchange_trailing_device_piv(global ipiv, 1-based) instead.\n");
-    std::exit(EXIT_FAILURE);
-}
-
-inline void cleanup_exchange_buffers() {}
+// exchange kernels do not own any global/static resources.
