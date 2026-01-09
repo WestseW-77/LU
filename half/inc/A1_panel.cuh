@@ -151,7 +151,6 @@ __global__ void panel_pivot_prescale_and_swap_coop_kernel(
         }
     }
 
-    // ensure swap completed before prescale reads pivot and column
     grid.sync();
 
     // 高斯消元
@@ -474,5 +473,3 @@ inline void launch_panel_TSLU(
 
     CUDA_CHECK(cudaGetLastError());
 }
-
-// panel kernels do not own any global/static resources.
