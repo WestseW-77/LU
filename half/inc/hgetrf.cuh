@@ -450,6 +450,7 @@ inline void hgetrf(
 
     int panel_width = h->panel_width;
     int uc = h->uc;
+    printf(" uc = %d\n", uc);
     if (panel_width <= 0) panel_width = 128;
     if (panel_width > k_total) panel_width = k_total;
 
