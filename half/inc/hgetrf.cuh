@@ -44,21 +44,19 @@ using half = __half;
 // 句柄：仿 cusolverDnHandle，内部只创建一次 stream/event
 // ============================================================================
 struct hgetrfHandle {
-    // 为了支持 dual-stream pipeline：
-    // - update stream 使用一个 cublas handle
-    // - panel stream 也需要独立的 cublas handle（避免 setStream 互相抢）
     cublasHandle_t cublas_update = nullptr;
     cublasHandle_t cublas_panel  = nullptr;
     bool owns_cublas_update = false;
     bool owns_cublas_panel  = false;
-    // 命令队列
+
     cudaStream_t   stream = 0;
     cudaStream_t   stream_panel = nullptr;
-    // Event 用于跨 stream 同步
+
     cudaEvent_t  ev_piv_ready  = nullptr;
     cudaEvent_t  ev_next_ready = nullptr;
 
-    int panel_width = 128;
+    // ✅ 固定 256 panel 宽度（默认值）
+    int panel_width = 256;
     int uc = 8;
 
     int    m_cached_max = 0;
@@ -70,23 +68,20 @@ using hgetrfHandle_t = hgetrfHandle*;
 
 inline void hgetrfCreate(hgetrfHandle_t* out)
 {
-    // 要有目标指针才可以初始化
-    if (!out) 
+    if (!out)
         return;
+
     hgetrfHandle_t h = new hgetrfHandle;
-    // 不会因默认的 stream 同步规则而被阻塞
+
     CUDA_CHECK(cudaStreamCreateWithFlags(&h->stream_panel, cudaStreamNonBlocking));
-    // event 仅用于同步而不记录时间戳
     CUDA_CHECK(cudaEventCreateWithFlags(&h->ev_piv_ready,  cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&h->ev_next_ready, cudaEventDisableTiming));
 
-    // cuBLAS 句柄也在这里创建（避免内部函数偷偷 create/destroy）
     CUBLAS_CHECK(cublasCreate(&h->cublas_update));
     h->owns_cublas_update = true;
     CUBLAS_CHECK(cublasCreate(&h->cublas_panel));
     h->owns_cublas_panel = true;
 
-    // 让默认行为更接近“高性能”配置（half GEMM 更容易走 Tensor Core 路径）
     CUBLAS_CHECK(cublasSetMathMode(h->cublas_update, CUBLAS_TENSOR_OP_MATH));
     CUBLAS_CHECK(cublasSetMathMode(h->cublas_panel,  CUBLAS_TENSOR_OP_MATH));
     CUBLAS_CHECK(cublasSetStream(h->cublas_update, h->stream));
@@ -97,7 +92,7 @@ inline void hgetrfCreate(hgetrfHandle_t* out)
 
 inline void hgetrfDestroy(hgetrfHandle_t h)
 {
-    if (!h) 
+    if (!h)
         return;
 
     if (h->cublas_update && h->owns_cublas_update) {
@@ -127,10 +122,11 @@ inline void hgetrfSetStream(hgetrfHandle_t h, cudaStream_t s)
     }
 }
 
-inline void hgetrfSetPanelWidth(hgetrfHandle_t h, int panel_width)
+// ✅ 对外接口不变，但内部强制固定为 256
+inline void hgetrfSetPanelWidth(hgetrfHandle_t h, int /*panel_width*/)
 {
     if (!h) return;
-    h->panel_width = panel_width;
+    h->panel_width = 256;
 }
 
 inline void hgetrfSetUc(hgetrfHandle_t h, int uc)
@@ -139,7 +135,6 @@ inline void hgetrfSetUc(hgetrfHandle_t h, int uc)
     h->uc = uc;
 }
 
-// 分配一个大块的 workspace 后，在这里又把这份大的 workspace 分割成不同部分给不同地方调用
 struct HgetrfWorkspaceView {
     half* d_panel_block_val = nullptr;
     int*  d_panel_block_idx = nullptr;
@@ -150,14 +145,14 @@ static inline size_t align_up(size_t x, size_t a) {
     return (x + (a - 1)) & ~(a - 1);
 }
 
-// 计算需要多大的 buffer
+// 计算需要多大的 buffer（✅ 不需要因为 panel 变 256 而改）
 inline void hgetrf_bufferSizeBytes(
     hgetrfHandle_t /*h*/,
     int m, int /*n*/, int /*lda*/,
     int /*panel_width*/,
     size_t* device_bytes)
 {
-    if (!device_bytes) 
+    if (!device_bytes)
         return;
 
     const int num_blocks = panel_TSLU_required_pivot_blocks(m, 0);
@@ -171,7 +166,6 @@ inline void hgetrf_bufferSizeBytes(
     *device_bytes = bytes;
 }
 
-// cuSOLVER-like: lwork is in half elements (cudaMalloc sizeof(half)*lwork)
 inline void hgetrf_bufferSize(
     hgetrfHandle_t h,
     int m, int n,
@@ -200,14 +194,12 @@ inline void hgetrf_bufferSize(
     h->workspace_bytes = bytes;
 }
 
-// 分配的 workspace 切成一段段给不同地方使用
 inline HgetrfWorkspaceView hgetrf_workspace_bind(
     void* d_workspace,
     size_t workspace_bytes,
     int num_blocks_pivot_max)
 {
     HgetrfWorkspaceView ws;
-
     ws.num_blocks_pivot_max = num_blocks_pivot_max;
 
     uint8_t* p = (uint8_t*)d_workspace;
@@ -229,7 +221,7 @@ inline HgetrfWorkspaceView hgetrf_workspace_bind(
     return ws;
 }
 
-// 看起来这个是一整个 panel 最后启动一次检查是否有出现 0，用 128 个线程就可以检查因为我们一个 panel 固定宽度为 128
+// 1 个 panel 最后启动一次检查 pivot==0
 __global__ void hgetrf_check_panel_pivots_zero_kernel(
     const half* __restrict__ A,
     int lda,
@@ -238,22 +230,18 @@ __global__ void hgetrf_check_panel_pivots_zero_kernel(
     const int* __restrict__ d_ipiv,  // 1-based
     int* __restrict__ d_info)        // device scalar
 {
-    // 这里用 1 个 block 够了：ib<=128，一般 128 线程一轮搞定
     int tid = threadIdx.x;
 
-    // 读取当前 info，如果已经非 0，直接退出（不浪费）
     int cur = *d_info;
-    if (cur != 0) 
+    if (cur != 0)
         return;
 
-    // 每个线程处理多步
     for (int kk = tid; kk < ib; kk += blockDim.x) {
         int step = j0 + kk;
         int piv  = d_ipiv[step] - 1;  // to 0-based
         half pv  = A[piv + (size_t)step * lda];
 
         if (pv == __float2half(0.0f)) {
-            // 写最早的 step+1，避免竞态
             atomicCAS(d_info, 0, step + 1);
         }
     }
@@ -261,8 +249,6 @@ __global__ void hgetrf_check_panel_pivots_zero_kernel(
 
 // ============================================================================
 // 核心：blocked LU with dual stream
-// - d_ipiv: global pivot (1-based), length >= min(m,n)
-// - d_info: device scalar int (0 init)
 // ============================================================================
 inline void hgetrf_blocked_half_dualstream_ws(
     half* dA,
@@ -296,13 +282,13 @@ inline void hgetrf_blocked_half_dualstream_ws(
     }
 
     const int k_total = (m < n) ? m : n;
-    if (k_total <= 0) 
+    if (k_total <= 0)
         return;
 
-    // 默认宽度 128，如果总体比 128 小则用小的
-    if (panel_width <= 0) 
-        panel_width = 128;
-    if (panel_width > k_total) 
+    // ✅ 固定 256（如果调用者传 0/负数，则兜底 256）
+    if (panel_width <= 0)
+        panel_width = 256;
+    if (panel_width > k_total)
         panel_width = k_total;
 
     auto do_panel = [&](int j0, int ib_now) {
@@ -311,16 +297,17 @@ inline void hgetrf_blocked_half_dualstream_ws(
         launch_panel_TSLU(
             dA, m, lda,
             j0, ib_now, uc_now,
-            d_ipiv,               // global ipiv (1-based)
+            d_ipiv,
             cublas_panel,
             stream_panel,
             ws.d_panel_block_val,
             ws.d_panel_block_idx,
             ws.num_blocks_pivot_max);
 
-        // ✅ 正确+快：每个 panel 只做 1 次 pivot==0 检测
-        // 线程数设置到 128（与你 panel_width 一致）
-        int threads = 128;
+        // ✅ pivot==0 检测线程数跟 panel 走，最大 256
+        int threads = (ib_now >= 256) ? 256 : ib_now;
+        if (threads <= 0) threads = 1;
+
         hgetrf_check_panel_pivots_zero_kernel<<<1, threads, 0, stream_panel>>>(
             dA, lda, j0, ib_now, d_ipiv, d_info);
         CUDA_CHECK(cudaGetLastError());
@@ -332,7 +319,7 @@ inline void hgetrf_blocked_half_dualstream_ws(
         CUDA_CHECK(cudaStreamWaitEvent(stream_update, ev_piv_ready, 0));
         launch_A_exchange_trailing_device_piv(
             dA, m, n, lda, j0, ib_now,
-            d_ipiv,             // global ipiv (1-based)
+            d_ipiv,
             stream_update);
     };
 
@@ -347,7 +334,6 @@ inline void hgetrf_blocked_half_dualstream_ws(
     auto do_gemm_range = [&](int j0, int ib_now, int col0, int n2) {
         if (n2 <= 0 || ib_now <= 0) return;
 
-        // ✅ 快：不在这里 setStream（外层 hgetrf 已经设过）
         launch_A22_gemm_tc_range(
             dA, m, n, lda,
             j0, ib_now,
@@ -403,25 +389,20 @@ inline void hgetrf_blocked_half_dualstream_ws(
     do_trsm(j0, ib_now);
     do_gemm_full(j0, ib_now);
 
-    // follow cuSolver style (caller controls sync/timing), but make the result
-    // visible on stream_update by bridging stream_panel completion back.
     CUDA_CHECK(cudaEventRecord(ev_next_ready, stream_panel));
     CUDA_CHECK(cudaStreamWaitEvent(stream_update, ev_next_ready, 0));
 }
 
 // ============================================================================
 // Public API: hgetrf (cuSOLVER-like)
-// - d_ipiv: device, length min(m,n), output (1-based pivot row)
-// - d_info: device scalar int, output (0=success, >0 singular position)
-// - workspace 外置
 // ============================================================================
 inline void hgetrf(
     hgetrfHandle_t h,
     int m, int n,
     half* dA, int lda,
     half* d_workspace,
-    int* d_ipiv,          // device output: global ipiv (1-based), length min(m,n)
-    int* d_info)          // device output: scalar int
+    int* d_ipiv,
+    int* d_info)
 {
     if (!h || !dA || !d_workspace || !d_ipiv || !d_info) {
         fprintf(stderr, "hgetrf: null pointer input.\n");
@@ -448,16 +429,17 @@ inline void hgetrf(
     const int k_total = (m < n) ? m : n;
     if (k_total <= 0) return;
 
-    int panel_width = h->panel_width;
+    // ✅ 内部固定 256，不改对外接口，但也不让你乱来
+    int panel_width = 256;
+    h->panel_width = 256;
+
     int uc = h->uc;
-    printf(" uc = %d\n", uc);
-    if (panel_width <= 0) panel_width = 128;
     if (panel_width > k_total) panel_width = k_total;
 
-    // bind workspace
-    HgetrfWorkspaceView ws = hgetrf_workspace_bind(d_workspace, h->workspace_bytes, h->num_blocks_pivot_max);
+    // bind workspace（✅ 不需要因为 panel=256 改 workspace）
+    HgetrfWorkspaceView ws = hgetrf_workspace_bind(
+        d_workspace, h->workspace_bytes, h->num_blocks_pivot_max);
 
-    // run
     hgetrf_blocked_half_dualstream_ws(
         dA, m, n, lda,
         panel_width, uc,
@@ -468,6 +450,6 @@ inline void hgetrf(
         ws,
         h->stream,
         h->stream_panel,
-        h->ev_piv_ready, 
+        h->ev_piv_ready,
         h->ev_next_ready);
 }
