@@ -328,7 +328,7 @@ __global__ __launch_bounds__(256) void clear_tril_upper(float* A, int lda) {
     }
 }
 
-// ========== 主函数：测试和性能评估 ==========
+// 主函数进行测试
 int main(int argc, char** argv) {
     if (argc != 3) {
         std::cerr << "Usage: " << argv[0] << " <M> <Nrhs>" << std::endl;
@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
     std::cout << "Now M only supports " << M << std::endl;
     std::cout << "Now Nrhs is " << Nrhs << std::endl;
     
-    // 检查Nrhs是否是16的倍数（2 stages × 8 cols）
+    // 检查Nrhs是否是16的倍数（2 stages × 8 cols），每次都是 8 行？[question]
     int cols_per_block = b_stage_cols * b_stage_count;
     if (Nrhs % cols_per_block != 0) {
         std::cerr << "Nrhs must be divisible by " << cols_per_block << std::endl;
