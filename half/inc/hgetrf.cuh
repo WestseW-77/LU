@@ -41,6 +41,28 @@
 using half = __half;
 
 // ============================================================================
+// Profiling helpers (enabled only when profile=true at runtime)
+// ============================================================================
+struct HgetrfProfileStat {
+    float t_panel_ms    = 0.0f;
+    float t_exchange_ms = 0.0f;
+    float t_trsm_ms     = 0.0f;
+    float t_gemm_ms     = 0.0f;
+
+    int panel_calls   = 0;
+    int exch_calls    = 0;
+    int trsm_calls    = 0;
+    int gemm_calls    = 0;
+
+    // total (measured on update stream timeline)
+    float t_total_ms = 0.0f;
+};
+
+static inline float safe_pct(float part, float total) {
+    return (total > 0.0f) ? (100.0f * part / total) : 0.0f;
+}
+
+// ============================================================================
 // 句柄：仿 cusolverDnHandle，内部只创建一次 stream/event
 // ============================================================================
 struct hgetrfHandle {
@@ -249,6 +271,7 @@ __global__ void hgetrf_check_panel_pivots_zero_kernel(
 
 // ============================================================================
 // 核心：blocked LU with dual stream
+// profile=true 时打印各阶段耗时占比
 // ============================================================================
 inline void hgetrf_blocked_half_dualstream_ws(
     half* dA,
@@ -262,7 +285,8 @@ inline void hgetrf_blocked_half_dualstream_ws(
     cudaStream_t stream_update,
     cudaStream_t stream_panel,
     cudaEvent_t  ev_piv_ready,
-    cudaEvent_t  ev_next_ready)
+    cudaEvent_t  ev_next_ready,
+    bool profile)       // ✅ 新增：运行时 profiling 开关
 {
     if (!dA || !d_ipiv || !d_info) {
         fprintf(stderr, "hgetrf_blocked_half_dualstream_ws: null pointer input.\n");
@@ -291,7 +315,27 @@ inline void hgetrf_blocked_half_dualstream_ws(
     if (panel_width > k_total)
         panel_width = k_total;
 
+    HgetrfProfileStat prof{};
+    cudaEvent_t ev_total_begin = nullptr, ev_total_end = nullptr;
+
+    // 每个阶段共用 2 个 event（profile=true 时才创建）
+    cudaEvent_t ev_s = nullptr, ev_e = nullptr;
+    cudaEvent_t ev_s_panel = nullptr, ev_e_panel = nullptr;
+
+    if (profile) {
+        CUDA_CHECK(cudaEventCreate(&ev_total_begin));
+        CUDA_CHECK(cudaEventCreate(&ev_total_end));
+        CUDA_CHECK(cudaEventCreate(&ev_s));
+        CUDA_CHECK(cudaEventCreate(&ev_e));
+        CUDA_CHECK(cudaEventCreate(&ev_s_panel));
+        CUDA_CHECK(cudaEventCreate(&ev_e_panel));
+
+        CUDA_CHECK(cudaEventRecord(ev_total_begin, stream_update));
+    }
+
     auto do_panel = [&](int j0, int ib_now) {
+        if (profile) CUDA_CHECK(cudaEventRecord(ev_s_panel, stream_panel));
+
         int uc_now = (uc > ib_now) ? ib_now : uc;
 
         launch_panel_TSLU(
@@ -313,14 +357,34 @@ inline void hgetrf_blocked_half_dualstream_ws(
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cudaEventRecord(ev_piv_ready, stream_panel));
+
+        if (profile) {
+            CUDA_CHECK(cudaEventRecord(ev_e_panel, stream_panel));
+            CUDA_CHECK(cudaEventSynchronize(ev_e_panel));
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev_s_panel, ev_e_panel));
+            prof.t_panel_ms += ms;
+            prof.panel_calls++;
+        }
     };
 
     auto do_exchange = [&](int j0, int ib_now) {
+        if (profile) CUDA_CHECK(cudaEventRecord(ev_s, stream_update));
+
         CUDA_CHECK(cudaStreamWaitEvent(stream_update, ev_piv_ready, 0));
         launch_A_exchange_trailing_device_piv(
             dA, m, n, lda, j0, ib_now,
             d_ipiv,
             stream_update);
+
+        if (profile) {
+            CUDA_CHECK(cudaEventRecord(ev_e, stream_update));
+            CUDA_CHECK(cudaEventSynchronize(ev_e));
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev_s, ev_e));
+            prof.t_exchange_ms += ms;
+            prof.exch_calls++;
+        }
     };
 
     auto do_trsm = [&](int j0, int ib_now) {
@@ -328,17 +392,39 @@ inline void hgetrf_blocked_half_dualstream_ws(
         int ntrail = n - col0;
         if (ntrail <= 0 || ib_now <= 0) return;
 
+        if (profile) CUDA_CHECK(cudaEventRecord(ev_s, stream_update));
+
         launch_A12_trsm(dA, m, n, lda, j0, ib_now, stream_update);
+
+        if (profile) {
+            CUDA_CHECK(cudaEventRecord(ev_e, stream_update));
+            CUDA_CHECK(cudaEventSynchronize(ev_e));
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev_s, ev_e));
+            prof.t_trsm_ms += ms;
+            prof.trsm_calls++;
+        }
     };
 
     auto do_gemm_range = [&](int j0, int ib_now, int col0, int n2) {
         if (n2 <= 0 || ib_now <= 0) return;
+
+        if (profile) CUDA_CHECK(cudaEventRecord(ev_s, stream_update));
 
         launch_A22_gemm_tc_range(
             dA, m, n, lda,
             j0, ib_now,
             col0, n2,
             cublas_update, stream_update);
+
+        if (profile) {
+            CUDA_CHECK(cudaEventRecord(ev_e, stream_update));
+            CUDA_CHECK(cudaEventSynchronize(ev_e));
+            float ms = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, ev_s, ev_e));
+            prof.t_gemm_ms += ms;
+            prof.gemm_calls++;
+        }
     };
 
     auto do_gemm_full = [&](int j0, int ib_now) {
@@ -391,10 +477,42 @@ inline void hgetrf_blocked_half_dualstream_ws(
 
     CUDA_CHECK(cudaEventRecord(ev_next_ready, stream_panel));
     CUDA_CHECK(cudaStreamWaitEvent(stream_update, ev_next_ready, 0));
+
+    if (profile) {
+        // total end
+        CUDA_CHECK(cudaEventRecord(ev_total_end, stream_update));
+        CUDA_CHECK(cudaEventSynchronize(ev_total_end));
+        CUDA_CHECK(cudaEventElapsedTime(&prof.t_total_ms, ev_total_begin, ev_total_end));
+
+        float total = prof.t_total_ms;
+        float parts = prof.t_panel_ms + prof.t_exchange_ms + prof.t_trsm_ms + prof.t_gemm_ms;
+
+        printf("\n[hgetrf profile] (panel_width=%d, uc=%d)\n", panel_width, uc);
+        printf("  total (update-stream wall): %8.3f ms\n", total);
+        printf("  panel   : %8.3f ms  (%5.1f%%)  calls=%d\n",
+               prof.t_panel_ms,    safe_pct(prof.t_panel_ms, total), prof.panel_calls);
+        printf("  exchange: %8.3f ms  (%5.1f%%)  calls=%d\n",
+               prof.t_exchange_ms, safe_pct(prof.t_exchange_ms, total), prof.exch_calls);
+        printf("  trsm    : %8.3f ms  (%5.1f%%)  calls=%d\n",
+               prof.t_trsm_ms,     safe_pct(prof.t_trsm_ms, total), prof.trsm_calls);
+        printf("  gemm    : %8.3f ms  (%5.1f%%)  calls=%d\n",
+               prof.t_gemm_ms,     safe_pct(prof.t_gemm_ms, total), prof.gemm_calls);
+        printf("  parts sum: %8.3f ms  (%.1f%% of total)\n",
+               parts, safe_pct(parts, total));
+
+        // cleanup events
+        CUDA_CHECK(cudaEventDestroy(ev_total_begin));
+        CUDA_CHECK(cudaEventDestroy(ev_total_end));
+        CUDA_CHECK(cudaEventDestroy(ev_s));
+        CUDA_CHECK(cudaEventDestroy(ev_e));
+        CUDA_CHECK(cudaEventDestroy(ev_s_panel));
+        CUDA_CHECK(cudaEventDestroy(ev_e_panel));
+    }
 }
 
 // ============================================================================
 // Public API: hgetrf (cuSOLVER-like)
+// ✅ 在原接口末尾增加 profile=false，可选参数，不影响旧调用点
 // ============================================================================
 inline void hgetrf(
     hgetrfHandle_t h,
@@ -402,7 +520,8 @@ inline void hgetrf(
     half* dA, int lda,
     half* d_workspace,
     int* d_ipiv,
-    int* d_info)
+    int* d_info,
+    bool profile = false)   // ✅ 新增：默认 false
 {
     if (!h || !dA || !d_workspace || !d_ipiv || !d_info) {
         fprintf(stderr, "hgetrf: null pointer input.\n");
@@ -451,5 +570,6 @@ inline void hgetrf(
         h->stream,
         h->stream_panel,
         h->ev_piv_ready,
-        h->ev_next_ready);
+        h->ev_next_ready,
+        profile);
 }

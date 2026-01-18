@@ -78,7 +78,7 @@ __global__ __launch_bounds__(launch_bound) void trsm_float_kernel(
     // B矩阵的列索引计算
     int base_col = bx * b_stage_cols * b_stage_count;  // 当前block处理的起始列
     int b_warp_offset = warp_id * row_process_size;    // 当前warp在共享内存中的偏移
-    int b_stage_stride = b_stage_cols * row_process_size;  // stage之间的跨度
+    int b_stage_stride = b_stage_cols * row_process_size;  // stage之间的跨度[fix]
     int b_tile_base = (base_col + warp_id) * row_process_size;  // 全局内存中的tile起始位置
 
     // ========== B矩阵双缓冲共享内存 ==========

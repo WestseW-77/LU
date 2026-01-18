@@ -51,7 +51,7 @@ using half = __half;
 struct TestConfig {
     int m       = 16384;
     int n       = 16384;
-    int uc      = 8;
+    int uc      = 32;
     int iters   = 10;
     int warmup  = 2;
     bool verbose = false;
@@ -302,7 +302,7 @@ TestResult test_matrix_lu(
         CUDA_CHECK(cudaEventRecord(ev_start));
         hgetrf(h, m, n, dA_half, lda,
                d_work,
-               d_ipiv, d_info);
+               d_ipiv, d_info, true);
         CUDA_CHECK(cudaEventRecord(ev_stop));
         CUDA_CHECK(cudaEventSynchronize(ev_stop));
 

@@ -1,5 +1,14 @@
-// A1_panel.cuh - Real optimization: Increase micro-block size
+// A1_panel.cuh
+// Aggressive optimization version:
+//   - Fuse per-column cooperative pivot + update into ONE cooperative kernel per micro-block (kb<=32)
+//   - Drastically reduce kernel launch count (previously: ~256 coop launches + ~224 update launches per panel)
+//   - Keep the existing block-out TRSM + GEMM inside panel (cuBLAS) for level-3 update
+//
+// Notes:
+//   * This keeps the external API the same: launch_panel_TSLU(...)
+//   * You SHOULD re-run hgetrf_bufferSize(...) after replacing this file (workspace size may change).
 #pragma once
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
@@ -37,167 +46,221 @@ namespace cg = cooperative_groups;
     } while (0)
 #endif
 
-using half = __half;
+using half  = __half;
+using half2 = __half2;
 
 static __device__ __forceinline__ half half_abs(half x) { return __habs(x); }
 
-// Original cooperative kernel (unchanged, proven correct)
-__global__ void panel_pivot_prescale_and_swap_coop_kernel(
+// =====================================================================================
+// (1) Fused cooperative kernel: factorize a micro-block [k0, kend) within the panel
+//     - Each iteration k does:
+//         pivot search -> pivot selection -> row swap (panel columns) -> scale + rank-1 update within micro-block
+//     - 1 cooperative launch per micro-block (kb<=32)
+// =====================================================================================
+__global__ void panel_getf2_microblock_coop_kernel(
     half* __restrict__ A,
     int m, int lda,
     int j0, int ib,
-    int k,
+    int k0, int kend,
     half* __restrict__ block_val,
     int*  __restrict__ block_idx,
     int num_blocks,
     int* __restrict__ d_ipiv)
 {
-    extern __shared__ unsigned char smem[];
-    const int tid      = threadIdx.x;
-    const int lane     = tid & (WARP_SIZE - 1);
-    const int warp_id  = tid / WARP_SIZE;
-    const int num_warps = blockDim.x / WARP_SIZE;
-
-    half* s_val = reinterpret_cast<half*>(smem);
-    int*  s_idx = reinterpret_cast<int*>(s_val + blockDim.x);
-
-    const int col_k = j0 + k;
-    const int row_k = j0 + k;
-    if (col_k >= m) return;
-
-    half local_max_val = __float2half(0.0f);
-    int  local_max_idx = row_k;
-
-    const int global_stride = blockDim.x * gridDim.x;
-    for (int idx = row_k + blockIdx.x * blockDim.x + tid; idx < m; idx += global_stride) {
-        half a = A[idx + (size_t)col_k * lda];
-        half v = half_abs(a);
-        if (v > local_max_val) { local_max_val = v; local_max_idx = idx; }
-    }
-
-    for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-        half ov = __shfl_down_sync(0xffffffff, local_max_val, off);
-        int  oi = __shfl_down_sync(0xffffffff, local_max_idx, off);
-        if (ov > local_max_val) { local_max_val = ov; local_max_idx = oi; }
-    }
-    if (lane == 0) { s_val[warp_id] = local_max_val; s_idx[warp_id] = local_max_idx; }
-    __syncthreads();
-
-    if (warp_id == 0) {
-        half vmax = (lane < num_warps) ? s_val[lane] : __float2half(0.0f);
-        int  vidx = (lane < num_warps) ? s_idx[lane] : row_k;
-
-        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-            half ov = __shfl_down_sync(0xffffffff, vmax, off);
-            int  oi = __shfl_down_sync(0xffffffff, vidx, off);
-            if (ov > vmax) { 
-                vmax = ov; 
-                vidx = oi; 
-            }
-        }
-        if (lane == 0) { 
-            block_val[blockIdx.x] = vmax; block_idx[blockIdx.x] = vidx; 
-        }
-    }
+    // Design choice:
+    //   ROW_TILE=512 means 1 block covers 512 rows using 256 threads (each thread handles 2 rows via half2).
+    //   That scales naturally for your m sizes:
+    //     m=32768 -> ~64 blocks; m=8192 -> ~16 blocks.
+    constexpr int THREADS  = 256;
+    constexpr int ROW_TILE = 512;
+    constexpr int MAX_KB   = 32;
 
     cg::grid_group grid = cg::this_grid();
-    grid.sync();
 
-    if (blockIdx.x == 0) {
-        half vmax = __float2half(0.0f);
-        int  vidx = row_k;
+    const int tid  = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp = tid / WARP_SIZE;
+    constexpr int NUM_WARPS = THREADS / WARP_SIZE;
 
-        for (int i = tid; i < num_blocks; i += blockDim.x) {
-            half v = block_val[i];
-            int  r = block_idx[i];
-            if (v > vmax) { vmax = v; vidx = r; }
+    __shared__ half s_warp_val[NUM_WARPS];
+    __shared__ int  s_warp_idx[NUM_WARPS];
+    __shared__ half sU[MAX_KB];
+
+    // Loop columns in this micro-block
+    for (int k = k0; k < kend; ++k) {
+        const int col_k = j0 + k;
+        const int row_k = j0 + k;
+        if (row_k >= m) break; // uniform
+
+        // ------------------------------
+        // 1) Pivot search within column col_k, rows [row_k, m)
+        //    Block i scans its tile starting at (row_k + i*ROW_TILE)
+        // ------------------------------
+        const int tile_start = row_k + (int)blockIdx.x * ROW_TILE;
+
+        half local_max = __float2half(0.0f);
+        int  local_idx = row_k;
+
+        int r0 = tile_start + tid * 2;
+        if (r0 < m) {
+            half a0 = A[r0 + (size_t)col_k * lda];
+            half v0 = half_abs(a0);
+            if (v0 > local_max) { local_max = v0; local_idx = r0; }
+
+            int r1 = r0 + 1;
+            if (r1 < m) {
+                half a1 = A[r1 + (size_t)col_k * lda];
+                half v1 = half_abs(a1);
+                if (v1 > local_max) { local_max = v1; local_idx = r1; }
+            }
         }
 
-        s_val[tid] = vmax;
-        s_idx[tid] = vidx;
+        // Warp reduce (max)
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+            half ov = __shfl_down_sync(0xffffffff, local_max, off);
+            int  oi = __shfl_down_sync(0xffffffff, local_idx, off);
+            if (ov > local_max) { local_max = ov; local_idx = oi; }
+        }
+        if (lane == 0) {
+            s_warp_val[warp] = local_max;
+            s_warp_idx[warp] = local_idx;
+        }
         __syncthreads();
 
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride && s_val[tid + stride] > s_val[tid]) {
-                s_val[tid] = s_val[tid + stride];
-                s_idx[tid] = s_idx[tid + stride];
+        // Warp0 reduces warps -> one value per block
+        if (warp == 0) {
+            half vmax = (lane < NUM_WARPS) ? s_warp_val[lane] : __float2half(0.0f);
+            int  vidx = (lane < NUM_WARPS) ? s_warp_idx[lane] : row_k;
+
+            for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+                half ov = __shfl_down_sync(0xffffffff, vmax, off);
+                int  oi = __shfl_down_sync(0xffffffff, vidx, off);
+                if (ov > vmax) { vmax = ov; vidx = oi; }
             }
-            __syncthreads();
+            if (lane == 0) {
+                block_val[blockIdx.x] = vmax;
+                block_idx[blockIdx.x] = vidx;
+            }
         }
 
-        if (tid == 0) {
-            const int piv = s_idx[0];
-            d_ipiv[row_k] = piv + 1;
-            block_idx[0]  = piv;
+        grid.sync();
+
+        // ------------------------------
+        // 2) Block0 reduces per-block maxima -> pivot row
+        // ------------------------------
+        if (blockIdx.x == 0) {
+            if (warp == 0) {
+                half vmax = __float2half(0.0f);
+                int  vidx = row_k;
+
+                for (int i = lane; i < num_blocks; i += WARP_SIZE) {
+                    half v = block_val[i];
+                    int  r = block_idx[i];
+                    if (v > vmax) { vmax = v; vidx = r; }
+                }
+
+                for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+                    half ov = __shfl_down_sync(0xffffffff, vmax, off);
+                    int  oi = __shfl_down_sync(0xffffffff, vidx, off);
+                    if (ov > vmax) { vmax = ov; vidx = oi; }
+                }
+
+                if (lane == 0) {
+                    d_ipiv[row_k] = vidx + 1; // 1-based
+                    block_idx[0]  = vidx;     // broadcast pivot row
+                }
+            }
         }
-    }
 
-    grid.sync();
+        grid.sync();
 
-    const int pivot_row = block_idx[0];
+        const int pivot_row = block_idx[0];
 
-    if (blockIdx.x == 0 && pivot_row != row_k) {
-        for (int j = j0 + tid; j < j0 + ib; j += blockDim.x) {
-            size_t off = (size_t)j * lda;
-            half tmp = A[row_k + off];
-            A[row_k + off] = A[pivot_row + off];
-            A[pivot_row + off] = tmp;
+        // ------------------------------
+        // 3) Swap row_k <-> pivot_row inside the panel columns [j0, j0+ib)
+        //    (Columns outside panel will be handled by A_exchange)
+        // ------------------------------
+        if (blockIdx.x == 0 && pivot_row != row_k) {
+            for (int j = j0 + tid; j < j0 + ib; j += THREADS) {
+                size_t off = (size_t)j * lda;
+                half tmp = A[row_k + off];
+                A[row_k + off] = A[pivot_row + off];
+                A[pivot_row + off] = tmp;
+            }
         }
-    }
 
-    grid.sync();
+        grid.sync();
 
-    const half pivot = A[row_k + (size_t)col_k * lda];
-    if (pivot == __float2half(0.0f)) 
-        return;
+        // ------------------------------
+        // 4) Scale + rank-1 update within this micro-block:
+        //      - Scale: A[r, col_k] /= pivot, for r > row_k
+        //      - Update: A[r, c] -= A[r,col_k] * A[row_k,c], for c in (col_k, j0+kend)
+        //    This replaces the old (scale kernel + update kernel) launches.
+        // ------------------------------
+        const half pivot = A[row_k + (size_t)col_k * lda];
+        if (pivot == __float2half(0.0f)) {
+            // keep grid.sync pattern identical
+            grid.sync();
+            continue;
+        }
 
-    for (int r = row_k + 1 + blockIdx.x * blockDim.x + tid; r < m; r += global_stride) {
-        A[r + (size_t)col_k * lda] = __hdiv(A[r + (size_t)col_k * lda], pivot);
+        const int col_begin = col_k + 1;
+        const int col_end   = j0 + kend;
+        int num_u = col_end - col_begin;  // <= 31 (since kend-k0<=32)
+        if (num_u < 0) num_u = 0;
+        if (num_u > MAX_KB) num_u = MAX_KB;
+
+        // Load U row into shared (per-block)
+        for (int t = tid; t < num_u; t += THREADS) {
+            const int c = col_begin + t;
+            sU[t] = A[row_k + (size_t)c * lda];
+        }
+        __syncthreads();
+
+        // Rows to update start from row_k+1
+        const int tile_u = row_k + 1 + (int)blockIdx.x * ROW_TILE;
+        const int rr = tile_u + tid * 2;
+        if (rr < m) {
+            // Scale L entries in this column
+            half a0 = A[rr + (size_t)col_k * lda];
+            half l0 = __hdiv(a0, pivot);
+            A[rr + (size_t)col_k * lda] = l0;
+
+            half l1 = __float2half(0.0f);
+            if (rr + 1 < m) {
+                half a1 = A[(rr + 1) + (size_t)col_k * lda];
+                l1 = __hdiv(a1, pivot);
+                A[(rr + 1) + (size_t)col_k * lda] = l1;
+            }
+
+            half2 L2;
+            L2.x = l0;
+            L2.y = l1;
+
+            // Update remaining columns inside the micro-block
+            for (int t = 0; t < num_u; ++t) {
+                const int c = col_begin + t;
+                const half2 U2 = __half2half2(sU[t]);
+
+                half2 Av2;
+                Av2.x = A[rr + (size_t)c * lda];
+                Av2.y = (rr + 1 < m) ? A[(rr + 1) + (size_t)c * lda] : __float2half(0.0f);
+
+                const half2 R2 = __hsub2(Av2, __hmul2(L2, U2));
+
+                A[rr + (size_t)c * lda] = R2.x;
+                if (rr + 1 < m) A[(rr + 1) + (size_t)c * lda] = R2.y;
+            }
+        }
+
+        // Ensure updates are visible before next pivot step
+        grid.sync();
     }
 }
 
-template<int ROW_TILE, int COL_TILE>
-__global__ void panel_update_kernel_range_tiled_half2(
-    half* __restrict__ A,
-    int m, int lda,
-    int j0,
-    int col_end,
-    int k)
-{
-    const int col_k = j0 + k;
-    const int row_k = j0 + k;
-    if (col_k >= m) 
-        return;
-
-    const int c0 = (col_k + 1) + (int)blockIdx.x * COL_TILE;
-    const int r0 = (row_k + 1) + (int)blockIdx.y * ROW_TILE + ((int)threadIdx.x * 2);
-    if (r0 >= m) 
-        return;
-
-    half2 L2;
-    L2.x = __ldg(&A[(r0 + 0) + (size_t)col_k * lda]);
-    L2.y = (r0 + 1 < m) ? __ldg(&A[(r0 + 1) + (size_t)col_k * lda]) : __float2half(0.0f);
-
-    #pragma unroll
-    for (int t = 0; t < COL_TILE; ++t) {
-        const int c = c0 + t;
-        if (c >= col_end) 
-            break;
-
-        const half U  = __ldg(&A[row_k + (size_t)c * lda]);
-        const half2 U2 = __half2half2(U);
-
-        half2 Av2;
-        Av2.x = A[(r0 + 0) + (size_t)c * lda];
-        Av2.y = (r0 + 1 < m) ? A[(r0 + 1) + (size_t)c * lda] : __float2half(0.0f);
-
-        const half2 R2 = __hsub2(Av2, __hmul2(L2, U2));
-
-        A[(r0 + 0) + (size_t)c * lda] = R2.x;
-        if (r0 + 1 < m) A[(r0 + 1) + (size_t)c * lda] = R2.y;
-    }
-}
-
+// =====================================================================================
+// (2) Existing panel block-out (TRSM + GEMM) inside panel: keep as-is
+// =====================================================================================
 template<int K_MAX>
 __global__ void panel_trsm_u12_warp_kernel(
     const half* __restrict__ A,
@@ -257,7 +320,7 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
     const int N = (j0 + ib) - col2;
     const int M = m - row2;
 
-    if (K <= 0 || N <= 0) 
+    if (K <= 0 || N <= 0)
         return;
     if (K > 32) {
         fprintf(stderr, "panel_blockout_trsm_gemm_inside_panel: K=%d > 32 not supported.\n", K);
@@ -300,10 +363,13 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
+// =====================================================================================
+// (3) Workspace sizing: how many cooperative blocks we will use (max)
+// =====================================================================================
 inline int panel_TSLU_required_pivot_blocks(int m, int j0)
 {
     const int m_effective = m - j0;
-    if (m_effective <= 0) 
+    if (m_effective <= 0)
         return 1;
 
     int dev = 0;
@@ -316,60 +382,52 @@ inline int panel_TSLU_required_pivot_blocks(int m, int j0)
         std::exit(EXIT_FAILURE);
     }
 
-    const int threads_pivot = 256;
-    const size_t shmem_coop = (size_t)threads_pivot * (sizeof(half) + sizeof(int));
-
+    const int threads = 256;
     int sm_count = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev));
 
     int max_blocks_per_sm = 0;
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm,
-        panel_pivot_prescale_and_swap_coop_kernel,
-        threads_pivot,
-        (int)shmem_coop));
+        panel_getf2_microblock_coop_kernel,
+        threads,
+        0));
 
     int max_coop_grid = sm_count * max_blocks_per_sm;
     if (max_coop_grid < 1) max_coop_grid = 1;
 
-    // Keep original logic (proven to work well)
-    int rows_per_block;
-    if (m_effective >= 24576) 
-        rows_per_block = 1024;
-    else if (m_effective >= 12288) 
-        rows_per_block = 512;
-    else if (m_effective >= 4096)  
-        rows_per_block = 256;
-    else 
-        rows_per_block = 128;
-
+    // Heuristic tuned for your m values.
+    // ROW_TILE=512 => blocks scale with m. m=32768 -> 64 blocks.
+    const int rows_per_block = 512;
     int num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
-    if (num_blocks < 1) 
-        num_blocks = 1;
-    if (num_blocks > 64) 
-        num_blocks = 64;
+
+    // Hard cap to avoid insane grid.sync overhead.
+    const int CAP = 128;
+    if (num_blocks < 1) num_blocks = 1;
+    if (num_blocks > CAP) num_blocks = CAP;
 
     if (num_blocks > max_coop_grid) {
-        int min_rows_per_block = (m_effective + max_coop_grid - 1) / max_coop_grid;
-        if (min_rows_per_block < 1) 
-            min_rows_per_block = 1;
-        rows_per_block = min_rows_per_block;
-        num_blocks = (m_effective + rows_per_block - 1) / rows_per_block;
-        if (num_blocks < 1) 
-            num_blocks = 1;
-    }
-
-    if (num_blocks > max_coop_grid) {
-        fprintf(stderr,
-                "panel_TSLU_required_pivot_blocks: cooperative grid too large. need=%d max=%d\n",
-                num_blocks, max_coop_grid);
-        std::exit(EXIT_FAILURE);
+        num_blocks = max_coop_grid;
+        if (num_blocks < 1) num_blocks = 1;
     }
 
     return num_blocks;
 }
 
-// ✅ Real optimization: Allow larger uc (micro-block size)
+static inline int panel_TSLU_choose_blocks_fast(int m_effective, int num_blocks_max)
+{
+    if (m_effective <= 0) return 1;
+    const int rows_per_block = 512;
+    int nb = (m_effective + rows_per_block - 1) / rows_per_block;
+    if (nb < 1) nb = 1;
+    if (nb > num_blocks_max) nb = num_blocks_max;
+    if (nb < 1) nb = 1;
+    return nb;
+}
+
+// =====================================================================================
+// (4) Public launcher: called by hgetrf.cuh
+// =====================================================================================
 inline void launch_panel_TSLU(
     half* A,
     int   m,
@@ -382,7 +440,7 @@ inline void launch_panel_TSLU(
     cudaStream_t stream,
     half* d_block_val,
     int*  d_block_idx,
-    int   num_blocks_pivot)
+    int   num_blocks_pivot_max)
 {
     if (!A || !d_ipiv || !d_block_val || !d_block_idx) {
         fprintf(stderr, "launch_panel_TSLU: null pointer input.\n");
@@ -404,54 +462,47 @@ inline void launch_panel_TSLU(
         std::exit(EXIT_FAILURE);
     }
 
-    if (num_blocks_pivot < 1) num_blocks_pivot = 1;
-    if (num_blocks_pivot > 64) num_blocks_pivot = 64;
+    if (num_blocks_pivot_max < 1) num_blocks_pivot_max = 1;
+    if (num_blocks_pivot_max > 128) num_blocks_pivot_max = 128;
 
-    const int threads_pivot = 256;
-    const size_t shmem_coop = (size_t)threads_pivot * (sizeof(half) + sizeof(int));
-
-    // ✅ Key optimization: Increase default uc, keep limit at 32 for TRSM kernel
-    int kb = (uc > 0) ? uc : 24;  // Changed from 16 to 24
+    // Micro-block size (kb) controls how many cooperative launches per panel:
+    //   launches per panel = ib / kb
+    int kb = (uc > 0) ? uc : 32;
     if (kb < 1) kb = 1;
     if (kb > ib) kb = ib;
-    if (kb > 32) kb = 32;  // Keep this limit for TRSM kernel compatibility
+    if (kb > 32) kb = 32;
 
-    constexpr int COL_TILE = 8;
-    constexpr int ROW_TILE = 512;
-    dim3 block_u(ROW_TILE / 2);
+    const int threads = 256;
 
     for (int k0 = 0; k0 < ib; k0 += kb) {
         int kend = k0 + kb;
         if (kend > ib) kend = ib;
 
-        for (int k = k0; k < kend; ++k) {
-            const int col = j0 + k;
-            if (col >= m) break;
+        // Choose smaller grid for later micro-blocks / later panels (cheap host-side heuristic)
+        const int row_base = j0 + k0;
+        const int m_eff = m - row_base;
+        int num_blocks = panel_TSLU_choose_blocks_fast(m_eff, num_blocks_pivot_max);
 
-            void* args[] = {
-                (void*)&A, (void*)&m, (void*)&lda,
-                (void*)&j0, (void*)&ib, (void*)&k,
-                (void*)&d_block_val, (void*)&d_block_idx,
-                (void*)&num_blocks_pivot, (void*)&d_ipiv
-            };
+        void* args[] = {
+            (void*)&A,
+            (void*)&m,
+            (void*)&lda,
+            (void*)&j0,
+            (void*)&ib,
+            (void*)&k0,
+            (void*)&kend,
+            (void*)&d_block_val,
+            (void*)&d_block_idx,
+            (void*)&num_blocks,
+            (void*)&d_ipiv
+        };
 
-            CUDA_CHECK(cudaLaunchCooperativeKernel(
-                (void*)panel_pivot_prescale_and_swap_coop_kernel,
-                dim3(num_blocks_pivot), dim3(threads_pivot),
-                args, shmem_coop, stream));
+        CUDA_CHECK(cudaLaunchCooperativeKernel(
+            (void*)panel_getf2_microblock_coop_kernel,
+            dim3(num_blocks), dim3(threads),
+            args, 0, stream));
 
-            const int rows_rem = m - (j0 + k + 1);
-            const int cols_in  = (j0 + kend) - (j0 + k + 1);
-            if (rows_rem > 0 && cols_in > 0) {
-                const int grid_x = (cols_in + COL_TILE - 1) / COL_TILE;
-                const int grid_y = (rows_rem + ROW_TILE - 1) / ROW_TILE;
-
-                panel_update_kernel_range_tiled_half2<ROW_TILE, COL_TILE>
-                    <<<dim3(grid_x, grid_y), block_u, 0, stream>>>(
-                        A, m, lda, j0, j0 + kend, k);
-            }
-        }
-
+        // Level-3 update for the rest of the panel columns
         panel_blockout_trsm_gemm_inside_panel(
             A, m, lda, j0, ib, k0, kend,
             cublas_handle,
