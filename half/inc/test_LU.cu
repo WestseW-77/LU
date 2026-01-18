@@ -51,7 +51,7 @@ using half = __half;
 struct TestConfig {
     int m       = 16384;
     int n       = 16384;
-    int uc      = 32;
+    int uc      = 16;
     int iters   = 10;
     int warmup  = 2;
     bool verbose = false;

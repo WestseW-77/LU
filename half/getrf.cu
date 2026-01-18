@@ -823,7 +823,7 @@ int main(int argc, char *argv[]) {
     hgetrfCreate(&hgetrf_handle);
     hgetrfSetStream(hgetrf_handle, 0);
     hgetrfSetPanelWidth(hgetrf_handle, 128);  // Panel宽度
-    hgetrfSetUc(hgetrf_handle, 8);            // 展开系数
+    hgetrfSetUc(hgetrf_handle, 16);            // 展开系数
 
     // ========================================
     // 第四阶段：分配工作空间
