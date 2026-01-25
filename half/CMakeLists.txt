@@ -32,3 +32,16 @@ target_link_libraries(${PROJECT_NAME}
     CUDA::curand)
 
 target_compile_options(${PROJECT_NAME} PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
+
+# test_LU: 便于在 build 目录直接 make
+add_executable(test_LU inc/test_LU.cu)
+target_include_directories(test_LU PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc)
+target_link_libraries(test_LU
+    CUDA::cuda_driver 
+    CUDA::cudart
+    CUDA::cusparse
+    CUDA::cublas
+    CUDA::cublasLt
+    CUDA::cusolver
+    CUDA::curand)
+target_compile_options(test_LU PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)

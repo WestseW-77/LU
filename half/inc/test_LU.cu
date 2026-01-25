@@ -13,11 +13,6 @@
 // 新的 cuSOLVER-like API
 #include "hgetrf.cuh"
 
-#include "A1_panel.cuh"
-#include "A12_TRSM.cuh"
-#include "A22_GEMM.cuh"
-#include "A_exchange.cuh"
-
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(call)                                                       \
     do {                                                                       \
@@ -240,7 +235,7 @@ TestResult test_matrix_lu(
     hgetrfCreate(&h);
     hgetrfSetStream(h, 0);
 
-    const int panel_width = 128;
+    const int panel_width = 256;
     const int k_total = std::min(m, n);
     hgetrfSetPanelWidth(h, panel_width);
     hgetrfSetUc(h, uc);

@@ -5,6 +5,7 @@
 #include <cublas_v2.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 
 namespace cg = cooperative_groups;
 
@@ -39,17 +40,42 @@ namespace cg = cooperative_groups;
 using half  = __half;
 using half2 = __half2;
 
-static __device__ __forceinline__ half half_abs(half x) { return __habs(x); }
-
 #ifndef PANEL_USE_FAST_INV
 #define PANEL_USE_FAST_INV 1
 #endif
 
+// 0: fast half2 micro-update (default)
+// 1: fp32 micro-update (slower, for accuracy, keep OFF for now)
+#ifndef PANEL_MICRO_UPDATE_FP32
+#define PANEL_MICRO_UPDATE_FP32 0
+#endif
+
+// ---------------------------
+// device helper: aligned half2 IO
+// ---------------------------
+static __device__ __forceinline__ bool is_half2_aligned_index(int r) {
+    return ((r & 1) == 0);
+}
+static __device__ __forceinline__ half2 ld_half2_aligned(const half* p) {
+    return *reinterpret_cast<const half2*>(p);
+}
+static __device__ __forceinline__ void st_half2_aligned(half* p, half2 v) {
+    *reinterpret_cast<half2*>(p) = v;
+}
+
 // =====================================================================================
-// Fused cooperative kernel: factorize micro-block [k0, kend) inside one panel
-// Key change vs your regressed version:
-//   - NO blocks cap here; caller chooses num_blocks based on ceil(m_eff/512)
-//   - Reduce grid.sync count per column: 4 -> 3 by merging (pivot reduce + swap) before a single grid.sync
+// Cooperative panel kernel: factorize micro-block [k0, kend) inside one panel
+//
+// Pivot 语义严格不变：每列全局选最大 |a| 的 pivot row，swap，写 ipiv(1-based)
+//
+// 性能刀：
+//   - 保留 2 次 grid.sync/列：
+//       (1) pivot candidates ready -> block0 reduce
+//       (2) swap 完成 -> 才能安全更新（因为 row piv 会被更新，swap 必须先完成）
+//   - 删除每列末尾那个 grid.sync：更新完成后不需要全网同步，因为：
+//       * 每个 block 只写自己的 row tile
+//       * 下一列 pivot search 每个 block 只读自己的 row tile
+//     全网对齐自然由下一列 pivot-reduce 那个 grid.sync 完成
 // =====================================================================================
 __global__ void panel_getf2_microblock_coop_kernel(
     half* __restrict__ A,
@@ -72,75 +98,91 @@ __global__ void panel_getf2_microblock_coop_kernel(
     const int warp = tid / WARP_SIZE;
     constexpr int NUM_WARPS = THREADS / WARP_SIZE;
 
-    __shared__ half s_warp_val[NUM_WARPS];
-    __shared__ int  s_warp_idx[NUM_WARPS];
-    __shared__ half sU[MAX_KB];
-    __shared__ int  s_piv_row;  // only meaningful in block0
+    // per-block pivot reduce
+    __shared__ float s_warp_val_f[NUM_WARPS];
+    __shared__ int   s_warp_idx[NUM_WARPS];
+
+    // pivot row cache (per-block)
+    __shared__ half  sU[MAX_KB];
+    __shared__ half2 sNegU2[MAX_KB]; // -U (half2) to avoid extra ops in inner loop
+
+    // block0 pivot row
+    __shared__ int   s_piv_row;
+
+    const half2 minus1 = __float2half2_rn(-1.0f);
 
     for (int k = k0; k < kend; ++k) {
         const int col_k = j0 + k;
         const int row_k = j0 + k;
         if (row_k >= m) break;
 
+        const size_t col_off = (size_t)col_k * (size_t)lda;
+
         // ------------------------------
-        // 1) Pivot search in this block's tile (coalesced)
+        // 1) Pivot search: each block scans its tile rows for column col_k
         // ------------------------------
         const int tile_start = row_k + (int)blockIdx.x * ROW_TILE;
 
-        half local_max = __float2half(0.0f);
-        int  local_idx = row_k;
+        float local_max_f = 0.0f;
+        int   local_idx   = row_k;
 
         int r0 = tile_start + tid * 2;
-        if (r0 < m) {
-            half a0 = A[r0 + (size_t)col_k * lda];
-            half v0 = half_abs(a0);
-            if (v0 > local_max) { local_max = v0; local_idx = r0; }
+        int r1 = r0 + 1;
 
-            int r1 = r0 + 1;
-            if (r1 < m) {
-                half a1 = A[r1 + (size_t)col_k * lda];
-                half v1 = half_abs(a1);
-                if (v1 > local_max) { local_max = v1; local_idx = r1; }
+        if (r0 < m) {
+            if (r1 < m && is_half2_aligned_index(r0)) {
+                const half* p = A + (size_t)r0 + col_off;
+                half2 a2 = ld_half2_aligned(p);
+                float2 f2 = __half22float2(a2);
+                float v0 = fabsf(f2.x);
+                float v1 = fabsf(f2.y);
+                if (v0 > local_max_f) { local_max_f = v0; local_idx = r0; }
+                if (v1 > local_max_f) { local_max_f = v1; local_idx = r1; }
+            } else {
+                float v0 = fabsf(__half2float(A[(size_t)r0 + col_off]));
+                if (v0 > local_max_f) { local_max_f = v0; local_idx = r0; }
+                if (r1 < m) {
+                    float v1 = fabsf(__half2float(A[(size_t)r1 + col_off]));
+                    if (v1 > local_max_f) { local_max_f = v1; local_idx = r1; }
+                }
             }
         }
 
-        // Warp reduce
+        // warp reduce (float + idx)
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-            half ov = __shfl_down_sync(0xffffffff, local_max, off);
-            int  oi = __shfl_down_sync(0xffffffff, local_idx, off);
-            if (ov > local_max) { local_max = ov; local_idx = oi; }
+            float ov = __shfl_down_sync(0xffffffff, local_max_f, off);
+            int   oi = __shfl_down_sync(0xffffffff, local_idx,   off);
+            if (ov > local_max_f) { local_max_f = ov; local_idx = oi; }
         }
         if (lane == 0) {
-            s_warp_val[warp] = local_max;
-            s_warp_idx[warp] = local_idx;
+            s_warp_val_f[warp] = local_max_f;
+            s_warp_idx[warp]   = local_idx;
         }
         __syncthreads();
 
-        // Warp0 -> per-block max
+        // warp0 -> per-block max
         if (warp == 0) {
-            half vmax = (lane < NUM_WARPS) ? s_warp_val[lane] : __float2half(0.0f);
-            int  vidx = (lane < NUM_WARPS) ? s_warp_idx[lane] : row_k;
+            float vmax = (lane < NUM_WARPS) ? s_warp_val_f[lane] : 0.0f;
+            int   vidx = (lane < NUM_WARPS) ? s_warp_idx[ lane] : row_k;
 
             for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
-                half ov = __shfl_down_sync(0xffffffff, vmax, off);
-                int  oi = __shfl_down_sync(0xffffffff, vidx, off);
+                float ov = __shfl_down_sync(0xffffffff, vmax, off);
+                int   oi = __shfl_down_sync(0xffffffff, vidx, off);
                 if (ov > vmax) { vmax = ov; vidx = oi; }
             }
             if (lane == 0) {
-                block_val[blockIdx.x] = vmax;
+                block_val[blockIdx.x] = __float2half_rn(vmax);
                 block_idx[blockIdx.x] = vidx;
             }
         }
 
-        // ✅ sync #1: ensure block_val/block_idx are ready
+        // ✅ grid.sync #1: ensure block_val/block_idx are ready for block0 reduce
         grid.sync();
 
         // ------------------------------
-        // 2) block0: reduce across blocks -> pivot row, then swap rows (same sync window)
-        //    (This removes one extra grid.sync vs the regressed version.)
+        // 2) block0 reduce across blocks -> pivot row, then swap rows across panel columns
         // ------------------------------
         if (blockIdx.x == 0) {
-            // warp0 does reduction, then broadcast to whole block0 for swap
             if (warp == 0) {
                 float vmax = 0.0f;
                 int   vidx = row_k;
@@ -150,39 +192,38 @@ __global__ void panel_getf2_microblock_coop_kernel(
                     int   r = block_idx[i];
                     if (v > vmax) { vmax = v; vidx = r; }
                 }
-
                 for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
                     float ov = __shfl_down_sync(0xffffffff, vmax, off);
                     int   oi = __shfl_down_sync(0xffffffff, vidx, off);
                     if (ov > vmax) { vmax = ov; vidx = oi; }
                 }
-
                 if (lane == 0) {
-                    s_piv_row      = vidx;
-                    d_ipiv[row_k]  = vidx + 1; // 1-based
-                    block_idx[0]   = vidx;     // broadcast via global for other blocks (after sync)
+                    s_piv_row     = vidx;
+                    d_ipiv[row_k] = vidx + 1; // 1-based
                 }
             }
             __syncthreads();
 
             const int piv = s_piv_row;
             if (piv != row_k) {
+                // swap rows across panel columns [j0, j0+ib)
+                // 注意：这个 swap 必须发生在 update 之前，因为 row piv 会被 update
                 for (int j = j0 + tid; j < j0 + ib; j += THREADS) {
-                    size_t off = (size_t)j * lda;
-                    half tmp = A[row_k + off];
-                    A[row_k + off] = A[piv + off];
-                    A[piv + off] = tmp;
+                    size_t off = (size_t)j * (size_t)lda;
+                    half tmp = A[(size_t)row_k + off];
+                    A[(size_t)row_k + off] = A[(size_t)piv + off];
+                    A[(size_t)piv + off] = tmp;
                 }
             }
         }
 
-        // ✅ sync #2: swap finished, pivot_row & pivot value stable
+        // ✅ grid.sync #2: swap finished; now safe to read pivot row at row_k and update rows below
         grid.sync();
 
         // ------------------------------
-        // 3) Scale + update within this micro-block (panel-local update)
+        // 3) Scale + update within this micro-block
         // ------------------------------
-        const half pivot = A[row_k + (size_t)col_k * lda];
+        const half pivot = A[(size_t)row_k + col_off];
         const bool singular = (pivot == __float2half(0.0f));
 
         float inv_piv_f = 0.0f;
@@ -203,56 +244,112 @@ __global__ void panel_getf2_microblock_coop_kernel(
         if (num_u < 0) num_u = 0;
         if (num_u > MAX_KB) num_u = MAX_KB;
 
-        // load U row into shared (small, <=31)
+        // Load pivot row U segment into shared, and -U as half2 for fast FMA
         if (tid < num_u) {
             const int c = col_begin + tid;
-            sU[tid] = A[row_k + (size_t)c * lda];
+            half u = A[(size_t)row_k + (size_t)c * (size_t)lda];
+            sU[tid] = u;
+            half2 u2 = __half2half2(u);
+            sNegU2[tid] = __hmul2(u2, minus1); // -u
         }
         __syncthreads();
 
-        // update rows in this block's tile (below row_k)
+        // Update rows below pivot (disjoint row tiles across blocks)
         const int tile_u = (row_k + 1) + (int)blockIdx.x * ROW_TILE;
         const int rr = tile_u + tid * 2;
 
         if (!singular && rr < m) {
-            half a0 = A[rr + (size_t)col_k * lda];
-            half a1 = (rr + 1 < m) ? A[(rr + 1) + (size_t)col_k * lda] : __float2half(0.0f);
+            const bool has2 = (rr + 1 < m);
+            const bool aligned = has2 && is_half2_aligned_index(rr);
 
-            half2 a2 = __halves2half2(a0, a1);
-            half2 L2 = __hmul2(a2, inv_piv_h2);
+#if PANEL_MICRO_UPDATE_FP32
+            // optional accuracy path (OFF by default)
+            const float inv_piv = inv_piv_f;
 
-            A[rr + (size_t)col_k * lda] = L2.x;
-            if (rr + 1 < m) A[(rr + 1) + (size_t)col_k * lda] = L2.y;
+            float a0f = __half2float(A[(size_t)rr + col_off]);
+            float a1f = has2 ? __half2float(A[(size_t)(rr + 1) + col_off]) : 0.0f;
 
-            const half2 minus1 = __float2half2_rn(-1.0f);
+            float l0 = a0f * inv_piv;
+            float l1 = a1f * inv_piv;
+
+            A[(size_t)rr + col_off] = __float2half_rn(l0);
+            if (has2) A[(size_t)(rr + 1) + col_off] = __float2half_rn(l1);
 
             for (int t = 0; t < num_u; ++t) {
                 const int c = col_begin + t;
+                const size_t coff = (size_t)c * (size_t)lda;
+                const float u = __half2float(sU[t]);
+
+                float v0 = __half2float(A[(size_t)rr + coff]);
+                v0 -= l0 * u;
+                A[(size_t)rr + coff] = __float2half_rn(v0);
+
+                if (has2) {
+                    float v1 = __half2float(A[(size_t)(rr + 1) + coff]);
+                    v1 -= l1 * u;
+                    A[(size_t)(rr + 1) + coff] = __float2half_rn(v1);
+                }
+            }
+#else
+            // fast half2 path
+            half2 a2;
+            if (aligned) {
+                a2 = ld_half2_aligned(A + (size_t)rr + col_off);
+            } else {
+                half a0 = A[(size_t)rr + col_off];
+                half a1 = has2 ? A[(size_t)(rr + 1) + col_off] : __float2half(0.0f);
+                a2 = __halves2half2(a0, a1);
+            }
+
+            half2 L2 = __hmul2(a2, inv_piv_h2);
+
+            // store L back to column col_k
+            if (aligned) {
+                st_half2_aligned(A + (size_t)rr + col_off, L2);
+            } else {
+                A[(size_t)rr + col_off] = L2.x;
+                if (has2) A[(size_t)(rr + 1) + col_off] = L2.y;
+            }
+
+            for (int t = 0; t < num_u; ++t) {
+                const int c = col_begin + t;
+                const size_t coff = (size_t)c * (size_t)lda;
 
                 half2 Av2;
-                Av2.x = A[rr + (size_t)c * lda];
-                Av2.y = (rr + 1 < m) ? A[(rr + 1) + (size_t)c * lda] : __float2half(0.0f);
-
-                half2 U2 = __half2half2(sU[t]);
-                half2 negU2 = __hmul2(U2, minus1);
+                if (aligned) {
+                    Av2 = ld_half2_aligned(A + (size_t)rr + coff);
+                } else {
+                    half v0 = A[(size_t)rr + coff];
+                    half v1 = has2 ? A[(size_t)(rr + 1) + coff] : __float2half(0.0f);
+                    Av2 = __halves2half2(v0, v1);
+                }
 
 #if __CUDA_ARCH__ >= 530
-                half2 R2 = __hfma2(L2, negU2, Av2); // Av2 - L2*U2
+                half2 R2 = __hfma2(L2, sNegU2[t], Av2); // Av2 - L2*U
 #else
+                // fallback
+                half2 U2 = __hmul2(sNegU2[t], minus1);
                 half2 R2 = __hsub2(Av2, __hmul2(L2, U2));
 #endif
-                A[rr + (size_t)c * lda] = R2.x;
-                if (rr + 1 < m) A[(rr + 1) + (size_t)c * lda] = R2.y;
+
+                if (aligned) {
+                    st_half2_aligned(A + (size_t)rr + coff, R2);
+                } else {
+                    A[(size_t)rr + coff] = R2.x;
+                    if (has2) A[(size_t)(rr + 1) + coff] = R2.y;
+                }
             }
+#endif
         }
 
-        // ✅ sync #3: updates finished before next column pivot
-        grid.sync();
+        // 关键：这里不再 grid.sync()！
+        // 下一列 pivot reduction 那个 grid.sync 会自然对齐所有 block，
+        // 且 pivot search 每个 block 只读自己更新过的 row tile，不需要全网同步。
     }
 }
 
 // =====================================================================================
-// TRSM (panel-internal) + GEMM (panel-internal) keep your existing path
+// TRSM (panel-internal) + GEMM (panel-internal)
 // =====================================================================================
 template<int K_MAX>
 __global__ void panel_trsm_u12_warp_kernel(
@@ -268,7 +365,7 @@ __global__ void panel_trsm_u12_warp_kernel(
     for (int idx = threadIdx.x; idx < K * K; idx += blockDim.x) {
         int i = idx % K;
         int j = idx / K;
-        sL[i + j * K_MAX] = A[(j0_k0 + i) + (size_t)(j0_k0 + j) * lda];
+        sL[i + j * K_MAX] = A[(j0_k0 + i) + (size_t)(j0_k0 + j) * (size_t)lda];
     }
     __syncthreads();
 
@@ -278,16 +375,16 @@ __global__ void panel_trsm_u12_warp_kernel(
     const int rhs = (int)blockIdx.x * (int)(blockDim.x / WARP_SIZE) + warp;
     if (rhs >= N) return;
 
-    half* colptr = U12 + (size_t)rhs * lda;
+    half* colptr = U12 + (size_t)rhs * (size_t)lda;
 
     for (int i = 0; i < K; ++i) {
         float bi = 0.0f;
         if (lane == 0) bi = __half2float(colptr[i]);
 
         float acc = 0.0f;
-        for (int k = lane; k < i; k += WARP_SIZE) {
-            float Lik = __half2float(sL[i + k * K_MAX]);
-            float xk  = __half2float(colptr[k]);
+        for (int kk = lane; kk < i; kk += WARP_SIZE) {
+            float Lik = __half2float(sL[i + kk * K_MAX]);
+            float xk  = __half2float(colptr[kk]);
             acc += Lik * xk;
         }
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1)
@@ -319,7 +416,7 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
         std::exit(EXIT_FAILURE);
     }
 
-    half* U12 = A + j0_k0 + (size_t)col2 * lda;
+    half* U12 = A + j0_k0 + (size_t)col2 * (size_t)lda;
 
     constexpr int WARPS_PER_BLOCK = 4;
     dim3 block(WARPS_PER_BLOCK * WARP_SIZE);
@@ -331,8 +428,8 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
 
     if (M <= 0) return;
 
-    half* L21 = A + row2 + (size_t)j0_k0 * lda;
-    half* A22 = A + row2 + (size_t)col2  * lda;
+    half* L21 = A + row2 + (size_t)j0_k0 * (size_t)lda;
+    half* A22 = A + row2 + (size_t)col2  * (size_t)lda;
 
     const float alpha = -1.0f;
     const float beta  =  1.0f;
@@ -350,11 +447,10 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
-// =====================================================================================
-// workspace sizing: return max blocks needed (no silly 32-cap)
-// =====================================================================================
+//  workspace 计算，返回需要多少个 block 对 panel 进行处理
 inline int panel_TSLU_required_pivot_blocks(int m, int j0)
 {
+    // 计算有效行数
     const int m_effective = m - j0;
     if (m_effective <= 0) return 1;
 
@@ -372,20 +468,26 @@ inline int panel_TSLU_required_pivot_blocks(int m, int j0)
     CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev));
 
     int max_blocks_per_sm = 0;
+    // 得到每个 sm 上最多可以同时跑几个我这样的 block
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &max_blocks_per_sm,
-        panel_getf2_microblock_coop_kernel,
-        256,
-        0));
+        panel_getf2_microblock_coop_kernel, // 函数指针
+        256, // 每个 block 的 thread 数
+        0)); // 动态共享内存大小
 
+    // 最多可以搞多少个 block
     int max_coop_grid = sm_count * max_blocks_per_sm;
-    if (max_coop_grid < 1) max_coop_grid = 1;
-
-    // tile mapping: 512 rows per block
+    if (max_coop_grid < 1) 
+        max_coop_grid = 1;
+    
+    // 每个 block 可以处理 512 行，计算我们总共需要多少个 block 去处理，不允许超过最大值
     int nb = (m_effective + 512 - 1) / 512;
-    if (nb < 1) nb = 1;
-    if (nb > max_coop_grid) nb = max_coop_grid;
-    if (nb < 1) nb = 1;
+    if (nb < 1) 
+        nb = 1;
+    if (nb > max_coop_grid) 
+        nb = max_coop_grid;
+    if (nb < 1) 
+        nb = 1;
 
     return nb;
 }
@@ -400,9 +502,7 @@ static inline int panel_TSLU_choose_blocks_fast(int m_effective, int num_blocks_
     return nb;
 }
 
-// =====================================================================================
-// public launcher
-// =====================================================================================
+// 对外暴露接口
 inline void launch_panel_TSLU(
     half* A,
     int   m,
@@ -428,11 +528,10 @@ inline void launch_panel_TSLU(
     if (ib <= 0) return;
     if (j0 < 0 || j0 >= m) return;
 
-    // micro-block size
     int kb = (uc > 0) ? uc : 16;
     if (kb < 1) kb = 1;
     if (kb > ib) kb = ib;
-    if (kb > 32) kb = 32; // TRSM kernel supports up to 32
+    if (kb > 32) kb = 32;
 
     const int threads = 256;
 
@@ -465,7 +564,6 @@ inline void launch_panel_TSLU(
             dim3(num_blocks), dim3(threads),
             args, 0, stream));
 
-        // panel internal block-out update
         panel_blockout_trsm_gemm_inside_panel(
             A, m, lda, j0, ib, k0, kend,
             cublas_handle,
