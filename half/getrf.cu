@@ -21,11 +21,7 @@
 
 using data_type = __half;
 
-// TRSM 路线：0=原有 half->float->half 的 cublasStrsm
-// 1=inv(L) + GEMM (类似 hpotrf 的 TRSM 处理，减少 B 的类型转换)
-#ifndef GETRF_TRSM_USE_INV_GEMM
-#define GETRF_TRSM_USE_INV_GEMM 0
-#endif
+// TRSM 路线：内部固定使用 inv(L) + GEMM（减少 B 的类型转换）
 
 // inv+GEMM 路线的列分块大小
 #ifndef GETRF_TRSM_TILE
@@ -104,7 +100,7 @@ __global__ void float_to_half_2d_kernel(const float* __restrict__ src, int src_l
 
 /**
  * TRSM Float 工作空间
- * 用途：存储转换后的float数据，避免频繁分配/释放内存
+ * 用途：存储 L 的 float 形式与 inv(L)，避免频繁分配/释放内存
  * 
  * 设计原理：
  * - 一次性分配足够大的空间
@@ -113,14 +109,12 @@ __global__ void float_to_half_2d_kernel(const float* __restrict__ src, int src_l
  */
 struct TrsmFloatWorkspace {
     float* A_float = nullptr;  // 存储转换后的A矩阵（L矩阵）
-    float* B_float = nullptr;  // 存储转换后的B矩阵（待求解矩阵）
     float* inv_float = nullptr; // 存储 inv(L) (float)
     half*  inv_half = nullptr;  // 存储 inv(L) (half)
     half*  B_half_tmp = nullptr; // GEMM 临时块 (half)
     int max_m = 0;             // 最大行数
     int max_ncols = 0;         // 最大列数
     int ldA = 0;               // A的leading dimension
-    int ldB = 0;               // B的leading dimension
     int trsm_tile = GETRF_TRSM_TILE;
 
     /**
@@ -132,12 +126,9 @@ struct TrsmFloatWorkspace {
         max_m = max_m_;
         max_ncols = max_ncols_;
         ldA = max_m;
-        ldB = max_m;
 
         // 分配A矩阵空间（方阵）
         CUDA_CHECK(cudaMalloc(&A_float, (size_t)max_m * (size_t)max_m * sizeof(float)));
-        // 分配B矩阵空间（可能是矩形）
-        CUDA_CHECK(cudaMalloc(&B_float, (size_t)max_m * (size_t)max_ncols * sizeof(float)));
         // inv(L) 空间（float/half）
         CUDA_CHECK(cudaMalloc(&inv_float, (size_t)max_m * (size_t)max_m * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&inv_half,  (size_t)max_m * (size_t)max_m * sizeof(half)));
@@ -155,12 +146,10 @@ struct TrsmFloatWorkspace {
      */
     void free() {
         if (A_float) CUDA_CHECK(cudaFree(A_float));
-        if (B_float) CUDA_CHECK(cudaFree(B_float));
         if (inv_float) CUDA_CHECK(cudaFree(inv_float));
         if (inv_half) CUDA_CHECK(cudaFree(inv_half));
         if (B_half_tmp) CUDA_CHECK(cudaFree(B_half_tmp));
         A_float = nullptr;
-        B_float = nullptr;
         inv_float = nullptr;
         inv_half = nullptr;
         B_half_tmp = nullptr;
@@ -173,10 +162,10 @@ struct TrsmFloatWorkspace {
  * 功能：求解 L * X = B，其中L是单位下三角矩阵
  * 
  * 算法原理：
- * 1. 基础情况（m <= nb）：直接调用cuBLAS的float版本TRSM
- *    - 先将half数据转换为float
- *    - 调用cublasStrsm求解
- *    - 将结果转回half
+ * 1. 基础情况（m <= nb）：先求 inv(L)，再用 GEMM 更新 B
+ *    - L 转 float -> inv(L)
+ *    - inv(L) 转 half
+ *    - GEMM 分块更新 B
  * 
  * 2. 递归情况（m > nb）：使用分治策略
  *    矩阵分块：[L11  0 ] [X1]   [B1]
@@ -194,7 +183,7 @@ struct TrsmFloatWorkspace {
  * @param B 待求解矩阵（输入为B，输出为X，half格式）
  * @param ldb B的leading dimension
  * @param nb 基础情况的阈值（递归终止条件）
- * @param ws 工作空间（用于half<->float转换）
+ * @param ws 工作空间（用于 inv+GEMM 临时区）
  */
 static void trsm_float_recursive(
     cublasHandle_t cublasH, int m, int ncols,
@@ -205,106 +194,71 @@ static void trsm_float_recursive(
 
     // 基础情况：m <= nb
     if (m <= nb) {
-#if GETRF_TRSM_USE_INV_GEMM
-        if (ws.inv_float && ws.inv_half && ws.B_half_tmp) {
-            cudaStream_t stream = 0;
-            CUBLAS_CHECK(cublasGetStream(cublasH, &stream));
-            dim3 blockDim(16, 16);
-            dim3 gridDim_A((m + 15) / 16, (m + 15) / 16);
-
-            // L -> float
-            half_to_float_2d_kernel<<<gridDim_A, blockDim, 0, stream>>>(
-                A, lda, ws.A_float, ws.ldA, m, m);
-            CUDA_CHECK(cudaGetLastError());
-
-            // inv_float = I
-            int total = m * m;
-            int block = 256;
-            int grid = std::min(1024, (total + block - 1) / block);
-            set_identity_f<<<grid, block, 0, stream>>>(
-                ws.inv_float, ws.ldA, m);
-            CUDA_CHECK(cudaGetLastError());
-
-            // inv_float = inv(L) (diag=unit)
-            float alpha = 1.0f;
-            CUBLAS_CHECK(cublasStrsm(
-                cublasH,
-                CUBLAS_SIDE_LEFT,
-                CUBLAS_FILL_MODE_LOWER,
-                CUBLAS_OP_N,
-                CUBLAS_DIAG_UNIT,
-                m, m, &alpha,
-                ws.A_float, ws.ldA,
-                ws.inv_float, ws.ldA));
-
-            // inv_half
-            float_to_half_2d_kernel<<<gridDim_A, blockDim, 0, stream>>>(
-                ws.inv_float, ws.ldA, ws.inv_half, ws.ldA, m, m);
-            CUDA_CHECK(cudaGetLastError());
-
-            // B = inv(L) * B (tile by columns to avoid aliasing)
-            int tile = ws.trsm_tile;
-            if (tile <= 0) tile = ncols;
-            if (tile > ncols) tile = ncols;
-            if (tile < 1) tile = 1;
-
-            for (int col = 0; col < ncols; col += tile) {
-                int nc = std::min(tile, ncols - col);
-                half* B_tile = B + (size_t)col * ldb;
-
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    ws.B_half_tmp, (size_t)ws.ldA * sizeof(half),
-                    B_tile,        (size_t)ldb * sizeof(half),
-                    (size_t)m * sizeof(half),
-                    (size_t)nc,
-                    cudaMemcpyDeviceToDevice, stream));
-
-                float alpha_g = 1.0f;
-                float beta_g  = 0.0f;
-                CUBLAS_CHECK(cublasGemmEx(
-                    cublasH, CUBLAS_OP_N, CUBLAS_OP_N,
-                    m, nc, m,
-                    &alpha_g,
-                    ws.inv_half,   CUDA_R_16F, ws.ldA,
-                    ws.B_half_tmp, CUDA_R_16F, ws.ldA,
-                    &beta_g,
-                    B_tile, CUDA_R_16F, ldb,
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            }
-
-            return;
-        }
-#endif
-
+        cudaStream_t stream = 0;
+        CUBLAS_CHECK(cublasGetStream(cublasH, &stream));
         dim3 blockDim(16, 16);
         dim3 gridDim_A((m + 15) / 16, (m + 15) / 16);
-        dim3 gridDim_B((m + 15) / 16, (ncols + 15) / 16);
 
-        // 步骤1：half -> float 转换
-        half_to_float_2d_kernel<<<gridDim_A, blockDim>>>(
+        // L -> float
+        half_to_float_2d_kernel<<<gridDim_A, blockDim, 0, stream>>>(
             A, lda, ws.A_float, ws.ldA, m, m);
-        half_to_float_2d_kernel<<<gridDim_B, blockDim>>>(
-            B, ldb, ws.B_float, ws.ldB, m, ncols);
         CUDA_CHECK(cudaGetLastError());
 
-        // 步骤2：调用cuBLAS TRSM（float版本）
-        // 求解 L * X = B，L是单位下三角（CUBLAS_DIAG_UNIT）
+        // inv_float = I
+        int total = m * m;
+        int block = 256;
+        int grid = std::min(1024, (total + block - 1) / block);
+        set_identity_f<<<grid, block, 0, stream>>>(
+            ws.inv_float, ws.ldA, m);
+        CUDA_CHECK(cudaGetLastError());
+
+        // inv_float = inv(L) (diag=unit)
         float alpha = 1.0f;
         CUBLAS_CHECK(cublasStrsm(
-            cublasH, 
-            CUBLAS_SIDE_LEFT,        // L在左侧
-            CUBLAS_FILL_MODE_LOWER,  // L是下三角
-            CUBLAS_OP_N,             // 不转置
-            CUBLAS_DIAG_UNIT,        // 单位对角线
-            m, ncols, &alpha,
+            cublasH,
+            CUBLAS_SIDE_LEFT,
+            CUBLAS_FILL_MODE_LOWER,
+            CUBLAS_OP_N,
+            CUBLAS_DIAG_UNIT,
+            m, m, &alpha,
             ws.A_float, ws.ldA,
-            ws.B_float, ws.ldB));
+            ws.inv_float, ws.ldA));
 
-        // 步骤3：float -> half 转换
-        float_to_half_2d_kernel<<<gridDim_B, blockDim>>>(
-            ws.B_float, ws.ldB, B, ldb, m, ncols);
+        // inv_half
+        float_to_half_2d_kernel<<<gridDim_A, blockDim, 0, stream>>>(
+            ws.inv_float, ws.ldA, ws.inv_half, ws.ldA, m, m);
         CUDA_CHECK(cudaGetLastError());
+
+        // B = inv(L) * B (tile by columns to avoid aliasing)
+        int tile = ws.trsm_tile;
+        if (tile <= 0) tile = ncols;
+        if (tile > ncols) tile = ncols;
+        if (tile < 1) tile = 1;
+
+        for (int col = 0; col < ncols; col += tile) {
+            int nc = std::min(tile, ncols - col);
+            half* B_tile = B + (size_t)col * ldb;
+
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                ws.B_half_tmp, (size_t)ws.ldA * sizeof(half),
+                B_tile,        (size_t)ldb * sizeof(half),
+                (size_t)m * sizeof(half),
+                (size_t)nc,
+                cudaMemcpyDeviceToDevice, stream));
+
+            float alpha_g = 1.0f;
+            float beta_g  = 0.0f;
+            CUBLAS_CHECK(cublasGemmEx(
+                cublasH, CUBLAS_OP_N, CUBLAS_OP_N,
+                m, nc, m,
+                &alpha_g,
+                ws.inv_half,   CUDA_R_16F, ws.ldA,
+                ws.B_half_tmp, CUDA_R_16F, ws.ldA,
+                &beta_g,
+                B_tile, CUDA_R_16F, ldb,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
 
         return;
     }

@@ -52,9 +52,8 @@ using half2 = __half2;
 #define HGETRF_EXCH_SPLIT_LEFT 1
 #endif
 
-// TRSM 路线
-// 0: 原有 A12 kernel
-// 1: inv(L11) + GEMM (类似 hpotrf 的 TRSM 处理)
+// TRSM 路线：内部固定使用 inv(L11) + GEMM（类似 hpotrf 的 TRSM 处理）
+// HGETRF_TRSM_MODE 保留兼容旧代码（不影响实现）。
 #ifndef HGETRF_TRSM_MODE
 #define HGETRF_TRSM_MODE 0
 #endif
@@ -86,6 +85,7 @@ struct hgetrfHandle {
     cudaEvent_t ev_exch_left_done = nullptr;
 #endif
 
+    // [fix]事后是需要把这些部分优化掉，不需要这么多冗余设计
     // true 表示该资源由 Handle 创建，Destroy 时需要释放
     // false 表示该资源由用户 Set 进来，Destroy 时不释放
     bool owns_cublas_update = false;
@@ -98,10 +98,10 @@ struct hgetrfHandle {
     bool owns_stream_exch_left = false;
 #endif
 
-    // 算法初始化参数可设置
+    // 算法初始化参数可设置 [find]这里还不知道为什么是这样的数值，尤其是 cublaslt
     int panel_width = 256;
     int uc = 32;
-    int trsm_mode = HGETRF_TRSM_MODE;
+    int trsm_mode = HGETRF_TRSM_MODE; // legacy: no longer used
     int trsm_tile = 4096;
 #if HGETRF_USE_CUBLASLT
     size_t lt_workspace_bytes = 32 * 1024 * 1024;
@@ -323,7 +323,7 @@ inline void hgetrf_bufferSize(hgetrfHandle_t h, int m, int n, const half* dA, in
     bytes += sizeof(int)  * num_blocks;
     bytes = align_up(bytes, 256); 
 
-    if (h->trsm_mode == 1 && nb > 0) {
+    if (nb > 0) {
         bytes = align_up(bytes, 256);
         bytes += sizeof(float) * (size_t)nb * (size_t)nb; // L_f
 
@@ -379,7 +379,7 @@ inline HgetrfWorkspaceView hgetrf_workspace_bind(hgetrfHandle_t h, void* d_works
     off = align_up(off, 256); ws.d_panel_block_idx = (int*)(p + off);
     off += sizeof(int) * (size_t)h->num_blocks_pivot_max;
 
-    if (h->trsm_mode == 1 && nb > 0) {
+    if (nb > 0) {
         off = align_up(off, 256); ws.d_L_f = (float*)(p + off);
         off += sizeof(float) * (size_t)nb * (size_t)nb;
 
@@ -468,8 +468,8 @@ static inline void hgetrf_cublas_gemm_ex(
             B, CUDA_R_16F, ldb,
             &beta_h,
             C, CUDA_R_16F, ldc,
-            computeType,
-            CUBLAS_GEMM_DEFAULT));
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     } else {
         float alpha = alpha_f;
         float beta  = beta_f;
@@ -482,8 +482,8 @@ static inline void hgetrf_cublas_gemm_ex(
             B, CUDA_R_16F, ldb,
             &beta,
             C, CUDA_R_16F, ldc,
-            computeType,
-            CUBLAS_GEMM_DEFAULT));
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 }
 
@@ -821,9 +821,6 @@ namespace cg = cooperative_groups;
     } while (0)
 #endif
 
-#ifndef PANEL_USE_FAST_INV
-#define PANEL_USE_FAST_INV 1
-#endif
 
 // ---------------------------
 // device helper: aligned half2 IO
@@ -838,20 +835,7 @@ static __device__ __forceinline__ void st_half2_aligned(half* p, half2 v) {
     *reinterpret_cast<half2*>(p) = v;
 }
 
-// =====================================================================================
-// Cooperative panel kernel: factorize micro-block [k0, kend) inside one panel
-//
-// Pivot 语义严格不变：每列全局选最大 |a| 的 pivot row，swap，写 ipiv(1-based)
-//
-// 性能刀：
-//   - 保留 2 次 grid.sync/列：
-//       (1) pivot candidates ready -> block0 reduce
-//       (2) swap 完成 -> 才能安全更新（因为 row piv 会被更新，swap 必须先完成）
-//   - 删除每列末尾那个 grid.sync：更新完成后不需要全网同步，因为：
-//       * 每个 block 只写自己的 row tile
-//       * 下一列 pivot search 每个 block 只读自己的 row tile
-//     全网对齐自然由下一列 pivot-reduce 那个 grid.sync 完成
-// =====================================================================================
+// panel 分解内的单列处理协作组函数，也是 panel 分解的最小执行单位
 __global__ void panel_getf2_microblock_coop_kernel(
     half* __restrict__ A,
     int m, int lda,
@@ -865,25 +849,27 @@ __global__ void panel_getf2_microblock_coop_kernel(
     constexpr int THREADS  = 256;
     // 每线程两个数据
     constexpr int ROW_TILE = 512;
-    // 限定了最大的步数
+    // 限定了最大的步数，也就是本小块内最多做多少列的分解
     constexpr int MAX_KB   = 32;
 
+    // 协作组句柄
     cg::grid_group grid = cg::this_grid();
 
+    // 线程的各种 id
     const int tid  = threadIdx.x;
     const int lane = tid & (WARP_SIZE - 1);
     const int warp = tid / WARP_SIZE;
+
     constexpr int NUM_WARPS = THREADS / WARP_SIZE;
 
-    // block 内规约
+    // block 内每个 warp 的规约结果
     __shared__ float s_warp_val_f[NUM_WARPS];
     __shared__ int   s_warp_idx[NUM_WARPS];
 
-    // pivot row cache (per-block)
-    // shared -U (half2), avoid extra ops in inner loop
-    __shared__ half2 sNegU2[MAX_KB]; // -U (half2) to avoid extra ops in inner loop
+    // 缓存当前主元的 U 部分 [question]缓存 U 是否需要更换数据，是否能用的线程太少因为只是很少的部分
+    __shared__ half2 sNegU2[MAX_KB];
 
-    // 最后找到的 pivot 行号
+    // 最后找到的 pivot 行号（blcok 内的最大）
     __shared__ int   s_piv_row;
 
     const half2 minus1 = __float2half2_rn(-1.0f);
@@ -928,7 +914,7 @@ __global__ void panel_getf2_microblock_coop_kernel(
             }
         }
 
-        // warp reduce (float + idx)
+        // warp 内规约
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
             float ov = __shfl_down_sync(0xffffffff, local_max_f, off);
             int   oi = __shfl_down_sync(0xffffffff, local_idx,   off);
@@ -940,7 +926,7 @@ __global__ void panel_getf2_microblock_coop_kernel(
         }
         __syncthreads();
 
-        // warp0 -> per-block max
+        // 第一个 warp 再进行 block 内规约
         if (warp == 0) {
             float vmax = (lane < NUM_WARPS) ? s_warp_val_f[lane] : 0.0f;
             int   vidx = (lane < NUM_WARPS) ? s_warp_idx[ lane] : row_k;
@@ -956,12 +942,10 @@ __global__ void panel_getf2_microblock_coop_kernel(
             }
         }
 
-        // ✅ grid.sync #1: ensure block_val/block_idx are ready for block0 reduce
+        // 所有 block 的结果都知道后进入下一步
         grid.sync();
 
-        // ------------------------------
-        // 2) block0 reduce across blocks -> pivot row, then swap rows across panel columns
-        // ------------------------------
+        // block0 得到 pivot 结果
         if (blockIdx.x == 0) {
             if (warp == 0) {
                 float vmax = 0.0f;
@@ -986,8 +970,7 @@ __global__ void panel_getf2_microblock_coop_kernel(
 
             const int piv = s_piv_row;
             if (piv != row_k) {
-                // swap rows across panel columns [j0, j0+ib)
-                // 注意：这个 swap 必须发生在 update 之前，因为 row piv 会被 update
+                // 进行块内行交换
                 for (int j = j0 + tid; j < j0 + ib; j += THREADS) {
                     size_t off = (size_t)j * (size_t)lda;
                     half tmp = A[(size_t)row_k + off];
@@ -997,34 +980,32 @@ __global__ void panel_getf2_microblock_coop_kernel(
             }
         }
 
-        // ✅ grid.sync #2: swap finished; now safe to read pivot row at row_k and update rows below
+        // 等待 pivot 与 块内 swap 结束后进行下一步更新
         grid.sync();
 
-        // ------------------------------
-        // 3) Scale + update within this micro-block
-        // ------------------------------
+        // LU 消元与更新
         const half pivot = A[(size_t)row_k + col_off];
         const bool singular = __heq(pivot, hzero);
 
+        // [fix]可以考虑是否要修改成不需转换的 float
         float inv_piv_f = 0.0f;
         if (!singular) {
             float piv_f = __half2float(pivot);
-#if PANEL_USE_FAST_INV
             inv_piv_f = __fdividef(1.0f, piv_f);
-#else
-            inv_piv_f = 1.0f / piv_f;
-#endif
         }
+        // 组成一个 half2 方便后续计算 
         half  inv_piv_h  = __float2half(inv_piv_f);
         half2 inv_piv_h2 = __half2half2(inv_piv_h);
 
+        // 拿到 U 需要更新的列范围
         const int col_begin = col_k + 1;
         const int col_end   = j0 + kend;
-        int num_u = col_end - col_begin; // <= 31 for kend-k0<=32
+        // 数据数量
+        int num_u = col_end - col_begin;
         if (num_u < 0) num_u = 0;
         if (num_u > MAX_KB) num_u = MAX_KB;
 
-        // Load pivot row U segment into shared as -U (half2) for fast FMA
+        // 载入 U 的数据 [fix] 可以考虑用的时候再换成向量
         if (tid < num_u) {
             const int c = col_begin + tid;
             half u = A[(size_t)row_k + (size_t)c * (size_t)lda];
@@ -1033,7 +1014,7 @@ __global__ void panel_getf2_microblock_coop_kernel(
         }
         __syncthreads();
 
-        // Update rows below pivot (disjoint row tiles across blocks)
+        // 每个 block 更新 512 行
         const int tile_u = (row_k + 1) + (int)blockIdx.x * ROW_TILE;
         const int rr = tile_u + tid * 2;
 
@@ -1251,7 +1232,7 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
             U12, CUDA_R_16F, lda,
             &beta_h,
             A22, CUDA_R_16F, lda,
-            computeType,
+            CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     } else {
         const float alpha = -1.0f;
@@ -1265,7 +1246,7 @@ static inline void panel_blockout_trsm_gemm_inside_panel(
             U12, CUDA_R_16F, lda,
             &beta,
             A22, CUDA_R_16F, lda,
-            computeType,
+            CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 }
@@ -1376,6 +1357,7 @@ inline void launch_panel_TSLU(
         if (kend > ib) 
             kend = ib;
 
+        // 我们当前做的是哪一行，刚开始的话等于列号
         const int row_base = j0 + k0;
         const int m_eff = m - row_base;
 
@@ -2038,7 +2020,7 @@ inline void launch_A22_gemm_tc_range(
                 A12, CUDA_R_16F, lda,
                 &beta_h,
                 A22, CUDA_R_16F, lda,
-                computeType,
+                CUBLAS_COMPUTE_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     } else {
         const float alpha = -1.0f;
@@ -2055,7 +2037,7 @@ inline void launch_A22_gemm_tc_range(
                 A12, CUDA_R_16F, lda,
                 &beta,
                 A22, CUDA_R_16F, lda,
-                computeType,
+                CUBLAS_COMPUTE_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 }
@@ -2279,65 +2261,60 @@ inline void hgetrf(
         int ntrail = n - col0;
         if (ntrail <= 0) return;
 
-        if (h->trsm_mode == 1 && ws.d_L_f && ws.d_inv_f && ws.d_inv_h && ws.d_trsm) {
-            const int ib = ib_now;
-            const int tile = (h->trsm_tile > 0) ? h->trsm_tile : 4096;
-            const int tile_use = (tile > ntrail) ? ntrail : tile;
+        const int ib = ib_now;
+        const int tile = (h->trsm_tile > 0) ? h->trsm_tile : 4096;
+        const int tile_use = (tile > ntrail) ? ntrail : tile;
 
-            // L11 (lower, unit diag) -> float
-            int total = ib * ib;
-            int block = 256;
-            int grid = std::min(1024, (total + block - 1) / block);
-            f16_to_f32_mat<<<grid, block, 0, s_main>>>(dA + (size_t)j0 + (size_t)j0 * (size_t)lda,
-                                                      lda, ws.d_L_f, ib, ib);
-            CUDA_CHECK(cudaGetLastError());
+        // L11 (lower, unit diag) -> float
+        int total = ib * ib;
+        int block = 256;
+        int grid = std::min(1024, (total + block - 1) / block);
+        f16_to_f32_mat<<<grid, block, 0, s_main>>>(dA + (size_t)j0 + (size_t)j0 * (size_t)lda,
+                                                  lda, ws.d_L_f, ib, ib);
+        CUDA_CHECK(cudaGetLastError());
 
-            // inv_f = I
-            set_identity_f<<<grid, block, 0, s_main>>>(ws.d_inv_f, ib, ib);
-            CUDA_CHECK(cudaGetLastError());
+        // inv_f = I
+        set_identity_f<<<grid, block, 0, s_main>>>(ws.d_inv_f, ib, ib);
+        CUDA_CHECK(cudaGetLastError());
 
-            // inv_f = inv(L11) (diag = unit)
-            const float one = 1.0f;
-            CUBLAS_CHECK(cublasStrsm(
+        // inv_f = inv(L11) (diag = unit)
+        const float one = 1.0f;
+        CUBLAS_CHECK(cublasStrsm(
+            cb_up,
+            CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
+            CUBLAS_OP_N, CUBLAS_DIAG_UNIT,
+            ib, ib,
+            &one,
+            ws.d_L_f, ib,
+            ws.d_inv_f, ib));
+
+        // inv_h = (half)inv_f
+        f32_to_f16_mat<<<grid, block, 0, s_main>>>(ws.d_inv_f, ib, ws.d_inv_h, ib, ib);
+        CUDA_CHECK(cudaGetLastError());
+
+        // A12 = inv(L11) * A12 (tile by columns to avoid aliasing)
+        for (int co = 0; co < ntrail; co += tile_use) {
+            int mcol = std::min(tile_use, ntrail - co);
+            half* B = dA + (size_t)j0 + (size_t)(col0 + co) * (size_t)lda; // (ib x mcol)
+
+            CUDA_CHECK(cudaMemcpy2DAsync(
+                ws.d_trsm, (size_t)ib * sizeof(half),
+                B,         (size_t)lda * sizeof(half),
+                (size_t)ib * sizeof(half),
+                (size_t)mcol,
+                cudaMemcpyDeviceToDevice, s_main));
+
+            hgetrf_cublas_gemm_ex(
                 cb_up,
-                CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
-                CUBLAS_OP_N, CUBLAS_DIAG_UNIT,
-                ib, ib,
-                &one,
-                ws.d_L_f, ib,
-                ws.d_inv_f, ib));
-
-            // inv_h = (half)inv_f
-            f32_to_f16_mat<<<grid, block, 0, s_main>>>(ws.d_inv_f, ib, ws.d_inv_h, ib, ib);
-            CUDA_CHECK(cudaGetLastError());
-
-            // A12 = inv(L11) * A12 (tile by columns to avoid aliasing)
-            for (int co = 0; co < ntrail; co += tile_use) {
-                int mcol = std::min(tile_use, ntrail - co);
-                half* B = dA + (size_t)j0 + (size_t)(col0 + co) * (size_t)lda; // (ib x mcol)
-
-                CUDA_CHECK(cudaMemcpy2DAsync(
-                    ws.d_trsm, (size_t)ib * sizeof(half),
-                    B,         (size_t)lda * sizeof(half),
-                    (size_t)ib * sizeof(half),
-                    (size_t)mcol,
-                    cudaMemcpyDeviceToDevice, s_main));
-
-                hgetrf_cublas_gemm_ex(
-                    cb_up,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    ib, mcol, ib,
-                    1.0f,
-                    ws.d_inv_h, ib,
-                    ws.d_trsm,  ib,
-                    0.0f,
-                    B,          lda,
-                    h->gemm_compute);
-            }
-            return;
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                ib, mcol, ib,
+                1.0f,
+                ws.d_inv_h, ib,
+                ws.d_trsm,  ib,
+                0.0f,
+                B,          lda,
+                h->gemm_compute);
         }
-
-        launch_A12_trsm(dA, m, n, lda, j0, ib_now, s_main);
     };
 
     // GEMM
