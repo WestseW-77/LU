@@ -847,74 +847,68 @@ __global__ void panel_getf2_microblock_coop_kernel(
     int* __restrict__ d_ipiv)
 {
     constexpr int THREADS  = 256;
-    // 每线程两个数据
+    // 每个 block 处理 512 行
     constexpr int ROW_TILE = 512;
-    // 限定了最大的步数，也就是本小块内最多做多少列的分解
     constexpr int MAX_KB   = 32;
 
-    // 协作组句柄
     cg::grid_group grid = cg::this_grid();
 
-    // 线程的各种 id
     const int tid  = threadIdx.x;
     const int lane = tid & (WARP_SIZE - 1);
     const int warp = tid / WARP_SIZE;
 
     constexpr int NUM_WARPS = THREADS / WARP_SIZE;
 
-    // block 内每个 warp 的规约结果
     __shared__ float s_warp_val_f[NUM_WARPS];
     __shared__ int   s_warp_idx[NUM_WARPS];
 
-    // 缓存当前主元的 U 部分 [question]缓存 U 是否需要更换数据，是否能用的线程太少因为只是很少的部分
+    // 缓存了整个 -U 在计算时可以直接使用
     __shared__ half2 sNegU2[MAX_KB];
-
-    // 最后找到的 pivot 行号（blcok 内的最大）
     __shared__ int   s_piv_row;
 
     const half2 minus1 = __float2half2_rn(-1.0f);
     const half  hzero  = __float2half(0.0f);
 
-    // 逐列处理
+    // 一次处理一列
     for (int k = k0; k < kend; ++k) {
         const int col_k = j0 + k;
         const int row_k = j0 + k;
-        if (row_k >= m) 
-            break;
+        if (row_k >= m) break;
 
         const size_t col_off = (size_t)col_k * (size_t)lda;
 
-        // pivot 操作
-        const int tile_start = row_k + (int)blockIdx.x * ROW_TILE;
+        // 如果不是偶数就 +1 变成偶数，第一行最后补充处理
+        const int base_piv   = row_k + (row_k & 1);
+        const int tile_start = base_piv + (int)blockIdx.x * ROW_TILE;
 
         float local_max_f = 0.0f;
         int   local_idx   = row_k;
 
-        // 每个线程处理两行，先试图使用向量化进行访问
-        int r0 = tile_start + tid * 2;
-        int r1 = r0 + 1;
-        
-        // 会在 float 下进行大小比较
-        if (r0 < m) {
-            if (r1 < m && is_half2_aligned_index(r0)) {
-                const half* p = A + (size_t)r0 + col_off;
-                half2 a2 = ld_half2_aligned(p);
-                float2 f2 = __half22float2(a2);
-                float v0 = fabsf(f2.x);
-                float v1 = fabsf(f2.y);
-                if (v0 > local_max_f) { local_max_f = v0; local_idx = r0; }
-                if (v1 > local_max_f) { local_max_f = v1; local_idx = r1; }
-            } else {
-                float v0 = fabsf(__half2float(A[(size_t)r0 + col_off]));
-                if (v0 > local_max_f) { local_max_f = v0; local_idx = r0; }
-                if (r1 < m) {
-                    float v1 = fabsf(__half2float(A[(size_t)r1 + col_off]));
-                    if (v1 > local_max_f) { local_max_f = v1; local_idx = r1; }
-                }
-            }
+        const int r0 = tile_start + tid * 2;   // always even
+        const int r1 = r0 + 1;
+
+        // 只用一次判断：r1 < m 说明 (r0,r1) 这一对完整有效
+        if (r1 < m) {
+            const half* p = A + (size_t)r0 + col_off;
+            half2 a2 = ld_half2_aligned(p);              // aligned by construction (m, lda even; r0 even)
+            float2 f2 = __half22float2(a2);
+            float v0 = fabsf(f2.x);
+            float v1 = fabsf(f2.y);
+            if (v0 > local_max_f) { local_max_f = v0; local_idx = r0; }
+            if (v1 > local_max_f) { local_max_f = v1; local_idx = r1; }
         }
 
-        // warp 内规约
+        // row_k 奇数时，row_k 行不在 tile 内（base_piv=row_k+1），手动注入候选
+        if ((row_k & 1) &&
+            (blockIdx.x == (num_blocks - 1)) &&
+            (warp == (NUM_WARPS - 1)) &&
+            (lane == 0))
+        {
+            float v = fabsf(__half2float(A[(size_t)row_k + col_off]));
+            if (v > local_max_f) { local_max_f = v; local_idx = row_k; }
+        }
+
+        // warp reduce
         for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
             float ov = __shfl_down_sync(0xffffffff, local_max_f, off);
             int   oi = __shfl_down_sync(0xffffffff, local_idx,   off);
@@ -926,10 +920,10 @@ __global__ void panel_getf2_microblock_coop_kernel(
         }
         __syncthreads();
 
-        // 第一个 warp 再进行 block 内规约
+        // block reduce (warp0)
         if (warp == 0) {
             float vmax = (lane < NUM_WARPS) ? s_warp_val_f[lane] : 0.0f;
-            int   vidx = (lane < NUM_WARPS) ? s_warp_idx[ lane] : row_k;
+            int   vidx = (lane < NUM_WARPS) ? s_warp_idx[lane]   : row_k;
 
             for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
                 float ov = __shfl_down_sync(0xffffffff, vmax, off);
@@ -942,10 +936,10 @@ __global__ void panel_getf2_microblock_coop_kernel(
             }
         }
 
-        // 所有 block 的结果都知道后进入下一步
+        // all blocks wrote their candidates
         grid.sync();
 
-        // block0 得到 pivot 结果
+        // ---- 2) block0 picks global pivot + swap rows inside panel columns ----
         if (blockIdx.x == 0) {
             if (warp == 0) {
                 float vmax = 0.0f;
@@ -970,9 +964,8 @@ __global__ void panel_getf2_microblock_coop_kernel(
 
             const int piv = s_piv_row;
             if (piv != row_k) {
-                // 进行块内行交换
                 for (int j = j0 + tid; j < j0 + ib; j += THREADS) {
-                    size_t off = (size_t)j * (size_t)lda;
+                    const size_t off = (size_t)j * (size_t)lda;
                     half tmp = A[(size_t)row_k + off];
                     A[(size_t)row_k + off] = A[(size_t)piv + off];
                     A[(size_t)piv + off] = tmp;
@@ -980,161 +973,117 @@ __global__ void panel_getf2_microblock_coop_kernel(
             }
         }
 
-        // 等待 pivot 与 块内 swap 结束后进行下一步更新
+        // wait for pivot + swap
         grid.sync();
 
-        // LU 消元与更新
+        // ---- 3) scale L + update chunk-U (kend范围内) ----
         const half pivot = A[(size_t)row_k + col_off];
         const bool singular = __heq(pivot, hzero);
 
-        // [fix]可以考虑是否要修改成不需转换的 float
         float inv_piv_f = 0.0f;
         if (!singular) {
-            float piv_f = __half2float(pivot);
-            inv_piv_f = __fdividef(1.0f, piv_f);
+            inv_piv_f = __fdividef(1.0f, __half2float(pivot));
         }
-        // 组成一个 half2 方便后续计算 
-        half  inv_piv_h  = __float2half(inv_piv_f);
-        half2 inv_piv_h2 = __half2half2(inv_piv_h);
+        const half  inv_piv_h  = __float2half(inv_piv_f);
+        const half2 inv_piv_h2 = __half2half2(inv_piv_h);
 
-        // 拿到 U 需要更新的列范围
         const int col_begin = col_k + 1;
         const int col_end   = j0 + kend;
-        // 数据数量
-        int num_u = col_end - col_begin;
+        int num_u = col_end - col_begin;     // <= 31
         if (num_u < 0) num_u = 0;
         if (num_u > MAX_KB) num_u = MAX_KB;
 
-        // 载入 U 的数据 [fix] 可以考虑用的时候再换成向量
+        // cache -U (scalar replicated into half2)
         if (tid < num_u) {
             const int c = col_begin + tid;
             half u = A[(size_t)row_k + (size_t)c * (size_t)lda];
-            half2 u2 = __half2half2(u);
-            sNegU2[tid] = __hmul2(u2, minus1); // -u
+            sNegU2[tid] = __hmul2(__half2half2(u), minus1); // -u
         }
         __syncthreads();
 
-        // 每个 block 更新 512 行
-        const int tile_u = (row_k + 1) + (int)blockIdx.x * ROW_TILE;
-        const int rr = tile_u + tid * 2;
+        const int row_start = row_k + 1;
+        if (!singular && row_start < m) {
 
-        if (!singular && rr < m) {
-            const bool has2 = (rr + 1 < m);
-            const bool aligned = has2 && is_half2_aligned_index(rr);
-            const size_t lda_s = (size_t)lda;
+            // 如果 row_start 是奇数，先单独处理这一行（否则 half2 会跳过它）
+            if ((row_start & 1) &&
+                (blockIdx.x == (num_blocks - 1)) &&
+                (warp == (NUM_WARPS - 1)))
+            {
+                const int r = row_start;
 
-            // half2 path
-            half* colk_ptr = A + (size_t)rr + col_off;
-            half2 a2 = aligned ? ld_half2_aligned(colk_ptr)
-                               : __halves2half2(colk_ptr[0], has2 ? colk_ptr[1] : hzero);
+                float Lf = 0.0f;
+                if (lane == 0) {
+                    float a = __half2float(A[(size_t)r + col_off]);
+                    Lf = a * inv_piv_f;
+                    A[(size_t)r + col_off] = __float2half_rn(Lf);
+                }
+                Lf = __shfl_sync(0xffffffff, Lf, 0);
 
-            half2 L2 = __hmul2(a2, inv_piv_h2);
-
-            // store L back to column col_k
-            if (aligned) st_half2_aligned(colk_ptr, L2);
-            else {
-                colk_ptr[0] = L2.x;
-                if (has2) colk_ptr[1] = L2.y;
+                if (lane < num_u) {
+                    const int c = col_begin + lane;
+                    const size_t off = (size_t)c * (size_t)lda;
+                    float Avf   = __half2float(A[(size_t)r + off]);
+                    float negUf = __half2float(__low2half(sNegU2[lane]));
+                    A[(size_t)r + off] = __float2half_rn(Avf + Lf * negUf);
+                }
             }
 
-            size_t coff = (size_t)col_begin * lda_s;
-            if (aligned) {
+            // half2 主体从偶数行开始
+            const int base_even = row_start + (row_start & 1); // even
+            const int tile_u = base_even + (int)blockIdx.x * ROW_TILE;
+            const int rr = tile_u + tid * 2;                   // even
+
+            if (rr < m) {
+                // m 偶数 + rr 偶数 => rr+1 < m 恒成立，直接 half2
+                half* colk_ptr = A + (size_t)rr + col_off;
+
+                half2 a2 = ld_half2_aligned(colk_ptr);
+                half2 L2 = __hmul2(a2, inv_piv_h2);
+                st_half2_aligned(colk_ptr, L2); // write L back
+
+                size_t coff = (size_t)col_begin * (size_t)lda;
+
                 int t = 0;
                 for (; t + 1 < num_u; t += 2) {
                     half2 Av2 = ld_half2_aligned(A + (size_t)rr + coff);
-                    half2 R2;
-#if __CUDA_ARCH__ < 530
-                    half2 U2;
-#endif
 #if __CUDA_ARCH__ >= 530
-                    R2 = __hfma2(L2, sNegU2[t], Av2); // Av2 - L2*U
+                    half2 R2  = __hfma2(L2, sNegU2[t], Av2);
 #else
-                    // fallback
-                    U2 = __hmul2(sNegU2[t], minus1);
-                    R2 = __hsub2(Av2, __hmul2(L2, U2));
+                    half2 U2  = __hmul2(sNegU2[t], minus1);
+                    half2 R2  = __hsub2(Av2, __hmul2(L2, U2));
 #endif
                     st_half2_aligned(A + (size_t)rr + coff, R2);
-                    coff += lda_s;
+                    coff += (size_t)lda;
 
                     Av2 = ld_half2_aligned(A + (size_t)rr + coff);
 #if __CUDA_ARCH__ >= 530
-                    R2 = __hfma2(L2, sNegU2[t + 1], Av2); // Av2 - L2*U
+                    R2  = __hfma2(L2, sNegU2[t + 1], Av2);
 #else
-                    U2 = __hmul2(sNegU2[t + 1], minus1);
-                    R2 = __hsub2(Av2, __hmul2(L2, U2));
+                    U2  = __hmul2(sNegU2[t + 1], minus1);
+                    R2  = __hsub2(Av2, __hmul2(L2, U2));
 #endif
                     st_half2_aligned(A + (size_t)rr + coff, R2);
-                    coff += lda_s;
+                    coff += (size_t)lda;
                 }
                 if (t < num_u) {
                     half2 Av2 = ld_half2_aligned(A + (size_t)rr + coff);
-                    half2 R2;
 #if __CUDA_ARCH__ >= 530
-                    R2 = __hfma2(L2, sNegU2[t], Av2); // Av2 - L2*U
+                    half2 R2  = __hfma2(L2, sNegU2[t], Av2);
 #else
-                    // fallback
-                    half2 U2 = __hmul2(sNegU2[t], minus1);
-                    R2 = __hsub2(Av2, __hmul2(L2, U2));
+                    half2 U2  = __hmul2(sNegU2[t], minus1);
+                    half2 R2  = __hsub2(Av2, __hmul2(L2, U2));
 #endif
                     st_half2_aligned(A + (size_t)rr + coff, R2);
-                }
-            } else {
-                int t = 0;
-                for (; t + 1 < num_u; t += 2) {
-                    half v0 = A[(size_t)rr + coff];
-                    half v1 = has2 ? A[(size_t)(rr + 1) + coff] : hzero;
-                    half2 Av2 = __halves2half2(v0, v1);
-                    half2 R2;
-#if __CUDA_ARCH__ < 530
-                    half2 U2;
-#endif
-#if __CUDA_ARCH__ >= 530
-                    R2 = __hfma2(L2, sNegU2[t], Av2); // Av2 - L2*U
-#else
-                    // fallback
-                    U2 = __hmul2(sNegU2[t], minus1);
-                    R2 = __hsub2(Av2, __hmul2(L2, U2));
-#endif
-                    A[(size_t)rr + coff] = R2.x;
-                    if (has2) A[(size_t)(rr + 1) + coff] = R2.y;
-                    coff += lda_s;
-
-                    v0 = A[(size_t)rr + coff];
-                    v1 = has2 ? A[(size_t)(rr + 1) + coff] : hzero;
-                    Av2 = __halves2half2(v0, v1);
-#if __CUDA_ARCH__ >= 530
-                    R2 = __hfma2(L2, sNegU2[t + 1], Av2); // Av2 - L2*U
-#else
-                    U2 = __hmul2(sNegU2[t + 1], minus1);
-                    R2 = __hsub2(Av2, __hmul2(L2, U2));
-#endif
-                    A[(size_t)rr + coff] = R2.x;
-                    if (has2) A[(size_t)(rr + 1) + coff] = R2.y;
-                    coff += lda_s;
-                }
-                if (t < num_u) {
-                    half v0 = A[(size_t)rr + coff];
-                    half v1 = has2 ? A[(size_t)(rr + 1) + coff] : hzero;
-                    half2 Av2 = __halves2half2(v0, v1);
-                    half2 R2;
-#if __CUDA_ARCH__ >= 530
-                    R2 = __hfma2(L2, sNegU2[t], Av2); // Av2 - L2*U
-#else
-                    // fallback
-                    half2 U2 = __hmul2(sNegU2[t], minus1);
-                    R2 = __hsub2(Av2, __hmul2(L2, U2));
-#endif
-                    A[(size_t)rr + coff] = R2.x;
-                    if (has2) A[(size_t)(rr + 1) + coff] = R2.y;
                 }
             }
         }
 
-        // 关键：这里不再 grid.sync()！
-        // 下一列 pivot reduction 那个 grid.sync 会自然对齐所有 block，
-        // 且 pivot search 每个 block 只读自己更新过的 row tile，不需要全网同步。
+        // 不做 grid.sync()，下一列 pivot 规约会自然对齐
     }
 }
+
+
+
 
 // =====================================================================================
 // TRSM (panel-internal) + GEMM (panel-internal)
